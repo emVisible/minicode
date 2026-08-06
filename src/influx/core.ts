@@ -65,6 +65,8 @@ export interface ToolCtx {
   ask: (req: { tool: string; summary: string }) => Promise<boolean>
   /** VBuild 虚拟文件系统: 存在时 write-file/read-file 走内存 overlay, RBuild 统一落盘 */
   vfs?: import("../vfs.ts").VFS
+  /** llm 节点流式输出回调(thinking 过程可视化) */
+  onStream?: (key: string, text: string) => void
 }
 
 export type FiberStatus = "placement" | "update" | "skip" | "blocked"
@@ -135,6 +137,7 @@ export type RuntimeEvent =
   | { type: "node-start"; key: string; tool: string; status: string }
   | { type: "node-end"; key: string; tool: string; status: string; ms: number; error?: string }
   | { type: "wave-end"; n: number; ms: number }
+  | { type: "stream"; key: string; text: string }
 
 export interface RuntimeOptions {
   serial?: boolean
@@ -176,7 +179,18 @@ export class Runtime {
     this.lastCached = []
     this.errors = {}
     this.blocked = {}
-    const ctx: ToolCtx = { results: this.results, errors: this.errors, cwd, ask, ...(vfs ? { vfs } : {}) }
+    const ctx: ToolCtx = {
+      results: this.results,
+      errors: this.errors,
+      cwd,
+      ask,
+      ...(vfs ? { vfs } : {}),
+      ...(onEvent
+        ? {
+            onStream: (key: string, text: string) => onEvent({ type: "stream", key, text }),
+          }
+        : {}),
+    }
     // 静态计划(非函数)一次 render 即可收敛; 函数计划随状态重渲染直到稳定
     const maxLoop = typeof plan === "function" ? maxIter : 1
 

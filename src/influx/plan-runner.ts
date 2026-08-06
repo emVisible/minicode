@@ -7,6 +7,7 @@
 import { Runtime, planFromSpec } from "./core.ts"
 import type { RuntimeEvent } from "./core.ts"
 import { getTool } from "./tools.ts"
+import { ensureAgentTools } from "./agent-tools.ts"
 import { createLLMClient, resolveEndpoint } from "../llm.ts"
 
 export interface PlanRunResult {
@@ -55,6 +56,7 @@ export interface RunSpecOpts {
 
 /** 给定 spec 直接执行(不再生成) —— 供双引擎自动分流复用 */
 export async function runSpec(spec: unknown, opts: RunSpecOpts = {}): Promise<PlanRunResult> {
+  await ensureAgentTools()
   const rt = new Runtime(getTool)
   const plan = planFromSpec(spec)
   const rep = await rt.run(plan, {
@@ -105,9 +107,16 @@ export async function generatePlanSpec(
     "规则:",
     "- 把任务拆成 3-8 个可独立执行的节点; 无依赖的节点不要互相 dependsOn(它们会全并行执行)",
     "- 只有真实数据依赖才用 dependsOn(如: 先读文件再基于内容写文件)",
-    "- 可用工具: shell(执行命令, params:{cmd}), read-file(params:{path}), write-file(params:{path,content}),",
-    "  list-dir(params:{path}), http.get(params:{url}), http.post(params:{url,body}), llm(params:{prompt}),",
-    "  agent.read(params:{path}), agent.bash(params:{cmd}), agent.glob(params:{pattern}), agent.grep(params:{pattern,path})",
+    "- **禁止用 llm 节点做任务主体**。llm 节点只用于: 生成文本内容(如报告/文案)、汇总前序结果。",
+    "  需要读文件/搜索/执行/修改时, 必须用文件工具:",
+    "- 可用工具:",
+    "  agent.glob(params:{pattern}) 搜索文件(如 '**/*.tsx')",
+    "  agent.grep(params:{pattern,path}) 搜索内容",
+    "  agent.read(params:{path}) 读文件",
+    "  write-file(params:{path,content}) 写文件(可引用 {$k1.content} 等前序结果)",
+    "  shell(params:{cmd}) 执行命令(bash/git/build/test)",
+    "  http.get(params:{url}) / http.post(params:{url,body}) 远端 API",
+    "  llm(params:{prompt}) 仅限生成文本/总结, 不作为主要执行手段",
     "- write-file 的 content 可引用前序结果: {$k1.answer} 或 {$k1.content}",
     "- 每个 key 唯一, 用 2-4 个小写字母数字",
     "- 若任务不适合拆解(纯问答/闲聊), 输出 { type:'task', key:'a1', tool:'llm', params:{prompt:'<原样转发>'}, children:[] }",

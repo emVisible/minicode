@@ -97,6 +97,8 @@ export interface TaskNode {
   status: TaskStatus
   ms?: number
   error?: string
+  /** 流式过程中的实时输出(如 llm thinking), 截断显示 */
+  note?: string
   children: TaskNode[]
 }
 

@@ -347,6 +347,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         spec = undefined
       }
       const nodes = spec ? countTaskNodes(spec) : 0
+      // 检查 spec 是否只有 llm 节点(纯问答无实际文件操作)
+      const hasFileOps = specHasFileOps(spec)
 
       // 拆解完成: 移除占位节点(后续 wave-start 会加入真实波次)
       if (treeRef.current) {
@@ -354,13 +356,21 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         bumpTree()
       }
 
-      if (nodes >= 2) {
+      if (nodes >= 2 && hasFileOps) {
         // ② Influx 全并行: 波次事件桥接任务树, 写操作进 VFS(VBuild)
         appendLine({ kind: "tool-result", text: `⚡ 已拆解为 ${nodes} 个任务, 全并行执行` })
         for (const l of renderSpec(spec).split("\n")) {
           appendLine({ kind: "tool-result", text: `  ${l}` })
         }
         let curWave = 0
+        const nodeStreams = new Map<string, string>()
+        const flushNodeStream = (key: string): void => {
+          const text = nodeStreams.get(key)
+          if (text) {
+            appendLine({ kind: "tool-result", text: `📝 ${key} 输出: ${text.slice(0, 600)}${text.length > 600 ? "…" : ""}` })
+            nodeStreams.delete(key)
+          }
+        }
         await runSpec(spec, {
           cwd,
           ask: queueAsk,
@@ -386,7 +396,25 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
                 }
                 break
               }
+              case "stream": {
+                // llm 节点 thinking 过程: 实时显示在树节点 note + 累积待 node-end 展示
+                const prev = nodeStreams.get(e.key) ?? ""
+                const text = prev + e.text
+                nodeStreams.set(e.key, text)
+                if (treeRef.current) {
+                  for (const wave of treeRef.current.children) {
+                    const node = wave.children.find((c) => c.id === e.key)
+                    if (node) {
+                      node.note = text.slice(-160)
+                      break
+                    }
+                  }
+                  bumpTree()
+                }
+                break
+              }
               case "node-end": {
+                flushNodeStream(e.key)
                 if (treeRef.current) {
                   const wave = treeRef.current.children.find((c) => c.id === `wave_${curWave}`)
                   const node = wave?.children.find((c) => c.id === e.key)
@@ -425,10 +453,16 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
             kind: "assistant",
             text: "RBuild 确认: 输入 y 落盘(并行写入), 输入 n 丢弃虚拟改动",
           })
+        } else {
+          appendLine({ kind: "tool-result", text: "✓ 执行完成: 无文件修改(纯读/生成任务)" })
         }
       } else {
-        // ③ 回退: 普通对话(纯问答/拆解失败)
-        if (spec) appendLine({ kind: "tool-result", text: "简单任务, 直接对话执行" })
+        // ③ 回退: 普通对话(纯问答/拆解失败/拆解只有 llm 节点)
+        if (spec && nodes >= 2 && !hasFileOps) {
+          appendLine({ kind: "tool-result", text: "拆解出的是纯分析任务(无文件操作), 走对话执行" })
+        } else if (spec) {
+          appendLine({ kind: "tool-result", text: "简单任务, 直接对话执行" })
+        }
         const result = await runAgent({
           history: historyRef.current,
           userMessage: { role: "user", content: prompt },
@@ -529,6 +563,19 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
               }
               break
             }
+            case "stream": {
+              if (treeRef.current) {
+                for (const wave of treeRef.current.children) {
+                  const node = wave.children.find((c) => c.id === e.key)
+                  if (node) {
+                    node.note = ((node.note ?? "") + e.text).slice(-160)
+                    break
+                  }
+                }
+                bumpTree()
+              }
+              break
+            }
             case "node-end": {
               if (treeRef.current) {
                 const wave = treeRef.current.children.find((c) => c.id === `wave_${currentWave}`)
@@ -570,6 +617,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
           kind: "assistant",
           text: `RBuild 确认: 输入 y 落盘(${s.create + s.modify + s.del} 个文件并行写入), 输入 n 丢弃`,
         })
+      } else {
+        appendLine({ kind: "tool-result", text: "✓ 计划执行完成: 无文件修改" })
       }
     } catch (e) {
       appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
@@ -860,6 +909,22 @@ function roleOf(kind: Line["kind"]): string {
     case "error":
       return "error"
   }
+}
+
+/** 检查 spec 是否包含实际文件操作节点(agent.* / write-file / shell 等) */
+function specHasFileOps(spec: unknown): boolean {
+  const FILE_TOOLS = new Set([
+    "agent.read", "agent.write", "agent.edit", "agent.bash", "agent.glob", "agent.grep",
+    "read-file", "write-file", "list-dir", "shell",
+  ])
+  const walk = (s: any): boolean => {
+    if (!s) return false
+    if (Array.isArray(s)) return s.some(walk)
+    if (typeof s !== "object") return false
+    if (typeof s.tool === "string" && FILE_TOOLS.has(s.tool)) return true
+    return walk(s.children ?? [])
+  }
+  return walk(spec)
 }
 
 function prefixFor(kind: Line["kind"]): string {

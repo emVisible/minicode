@@ -312,6 +312,48 @@ async function main(): Promise<void> {
     rmSync(dir, { recursive: true, force: true })
   }
 
+  // 场景 0c: 双引擎文件操作 spec — agent.* 工具可用(ensureAgentTools), 无依赖同波并行,
+  //          依赖链串行, VBuild 暂存 → RBuild 落盘
+  {
+    const { mkdtempSync, writeFileSync, readFileSync, rmSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "smoke-dual-"))
+    writeFileSync(join(dir, "ui.tsx"), "old", "utf8")
+    writeFileSync(join(dir, "a.ts"), "const a = 1", "utf8")
+    const { runSpec } = await import("../src/influx/plan-runner.ts")
+    const { VFS } = await import("../src/vfs.ts")
+    const vfs = new VFS(dir)
+    const waves: string[][] = []
+    const spec = {
+      type: "flow", key: "root",
+      children: [
+        { type: "task", key: "g1", tool: "agent.glob", params: { pattern: "**/*.tsx" } },
+        { type: "task", key: "s1", tool: "agent.read", params: { path: join(dir, "a.ts") } },
+        { type: "task", key: "r1", tool: "agent.read", params: { path: join(dir, "ui.tsx") }, dependsOn: ["g1"] },
+        { type: "task", key: "w1", tool: "write-file", params: { path: join(dir, "ui.tsx"), content: "{$r1.output}" }, dependsOn: ["r1"] },
+      ],
+    }
+    const rep = await runSpec(spec, {
+      cwd: dir, vfs,
+      onEvent: (e) => {
+        if (e.type === "wave-start") waves.push([])
+        if (e.type === "node-start") waves[waves.length - 1]!.push(e.key)
+      },
+    })
+    check("dual: agent.* 工具可用且无错误", Object.keys(rep.errors).length === 0, JSON.stringify(rep.errors))
+    check("dual: 无依赖节点同波并行", !!(waves[1]?.includes("g1") && waves[1]?.includes("s1")))
+    check(
+      "dual: 依赖链串行",
+      waves.findIndex((w) => w.includes("r1")) > waves.findIndex((w) => w.includes("g1")) &&
+        waves.findIndex((w) => w.includes("w1")) > waves.findIndex((w) => w.includes("r1")),
+    )
+    check("dual: VBuild 暂存磁盘未动", readFileSync(join(dir, "ui.tsx"), "utf8") === "old" && vfs.hasChanges())
+    await vfs.commit()
+    check("dual: RBuild 落盘", readFileSync(join(dir, "ui.tsx"), "utf8") !== "old")
+    rmSync(dir, { recursive: true, force: true })
+  }
+
   // 场景 1: write 被调用 → 工具结果回喂 → 模型给出最终文本
   {
     const s = await runScenario(scenario1, "请创建文件 /tmp/minicode-smoke-1.txt 内容为 hello mini")

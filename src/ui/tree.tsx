@@ -107,6 +107,7 @@ export function TaskTree({ run }: { run: TreeRun }): ReactNode {
                     {args ? ` ${args}` : ""}
                     {suffix}
                     {err}
+                    {node.note ? ` — ${node.note}` : ""}
                   </Text>
                 )
               })}

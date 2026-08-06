@@ -195,7 +195,7 @@ registerTool(
       return loop({ prompt, system, model, temperature, url, timeoutMs, tools, maxSteps, ctx })
     }
 
-    // 单问模式: 复用与对话侧完全相同的流式客户端
+    // 单问模式: 复用与对话侧完全相同的流式客户端; 流式 delta 转发给 UI(thinking 过程)
     const res = await client.stream({
       messages: [
         ...(system ? [{ role: "system" as const, content: system }] : []),
@@ -204,6 +204,9 @@ registerTool(
       tools: [],
       model,
       temperature,
+      onEvent: (e) => {
+        if (e.type === "text-delta" && ctx.onStream) ctx.onStream("llm", e.text)
+      },
     })
     if (res.message.tool_calls?.length) throw new Error("[llm] 意外收到 tool_calls(未传 tools)")
     return { answer: res.message.content }
