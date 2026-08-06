@@ -72,45 +72,45 @@ export function TaskTree({ run }: { run: TreeRun }): ReactNode {
   const root = run.root
   return (
     <Box flexDirection="column" width="100%">
-      <Text color="green">你: {run.prompt}</Text>
-      {root.children.length === 0 && (
+      {root.children.length === 0 ? (
         <Text color="gray">  └─ (等待任务拆解…)</Text>
+      ) : (
+        root.children.map((wave) => {
+          const parallel = wave.children.length > 1
+          const doneCount = wave.children.filter((c) => c.status === "done" || c.status === "error").length
+          const header =
+            wave.status === "running"
+              ? `${parallel ? "⚡" : "→"} 波次 ${wave.id.replace("wave_", "")}${parallel ? ` · ${wave.children.length} 并行` : ""}`
+              : wave.status === "done"
+                ? `✓ 波次 ${wave.id.replace("wave_", "")} (${doneCount}/${wave.children.length})`
+                : `○ 波次 ${wave.id.replace("wave_", "")}`
+          const headerColor = wave.status === "done" ? "green" : wave.status === "running" ? "cyan" : "gray"
+          return (
+            <Box key={wave.id} flexDirection="column" width="100%">
+              <Text color={headerColor}>
+                {"  ├─ "}
+                {header}
+              </Text>
+              {wave.children.map((node, i) => {
+                const sym = STATUS_SYMBOL[node.status]
+                const isLast = i === wave.children.length - 1
+                const args = node.args ? JSON.stringify(node.args).slice(0, 60) : ""
+                const suffix = node.ms !== undefined ? ` (${node.ms.toFixed(0)}ms)` : ""
+                const err = node.error ? ` — ${node.error.slice(0, 60)}` : ""
+                return (
+                  <Text key={node.id} color={sym.color}>
+                    {"  "}
+                    {isLast ? "  └─" : "  ├─"} {sym.char} {node.label}
+                    {args ? ` ${args}` : ""}
+                    {suffix}
+                    {err}
+                  </Text>
+                )
+              })}
+            </Box>
+          )
+        })
       )}
-      {root.children.map((wave) => {
-        const parallel = wave.children.length > 1
-        const doneCount = wave.children.filter((c) => c.status === "done" || c.status === "error").length
-        const header =
-          wave.status === "running"
-            ? `${parallel ? "⚡" : "→"} 波次 ${wave.id.replace("wave_", "")}${parallel ? ` · ${wave.children.length} 并行` : ""}`
-            : wave.status === "done"
-              ? `✓ 波次 ${wave.id.replace("wave_", "")} (${doneCount}/${wave.children.length})`
-              : `○ 波次 ${wave.id.replace("wave_", "")}`
-        const headerColor = wave.status === "done" ? "green" : wave.status === "running" ? "cyan" : "gray"
-        return (
-          <Box key={wave.id} flexDirection="column" width="100%">
-            <Text color={headerColor}>
-              {"  ├─ "}
-              {header}
-            </Text>
-            {wave.children.map((node, i) => {
-              const sym = STATUS_SYMBOL[node.status]
-              const isLast = i === wave.children.length - 1
-              const args = node.args ? JSON.stringify(node.args).slice(0, 60) : ""
-              const suffix = node.ms !== undefined ? ` (${node.ms.toFixed(0)}ms)` : ""
-              const err = node.error ? ` — ${node.error.slice(0, 60)}` : ""
-              return (
-                <Text key={node.id} color={sym.color}>
-                  {"  "}
-                  {isLast ? "  └─" : "  ├─"} {sym.char} {node.label}
-                  {args ? ` ${args}` : ""}
-                  {suffix}
-                  {err}
-                </Text>
-              )
-            })}
-          </Box>
-        )
-      })}
     </Box>
   )
 }

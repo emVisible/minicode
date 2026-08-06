@@ -34,6 +34,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const [input, setInput] = useState("")
   const [busy, setBusy] = useState(false)
   const [step, setStep] = useState(0)
+  const [spinner, setSpinner] = useState(0)
+  const spinnerTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [ask, setAsk] = useState<{ tool: string; summary: string } | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [configDraft, setConfigDraft] = useState<MinicodeConfig>({})
@@ -54,17 +56,18 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const [tree, setTree] = useState<TaskNode | null>(null)
   const [treePrompt, setTreePrompt] = useState("")
 
-  /** 同步更新 lines state + ref, 避免流式回调闭包读到过期数组 */
+  /** 同步更新 lines state + ref。注意: updater 必须保持纯函数(React 可能多次调用),
+   *  ref 的同步放到 useEffect 里做, 避免在 updater 内产生副作用 */
   function syncLines(updater: (prev: Line[]) => Line[]): void {
-    setLines((prev) => {
-      const next = updater(prev)
-      linesRef.current = next
-      return next
-    })
+    setLines(updater)
   }
 
+  useEffect(() => {
+    linesRef.current = lines
+  }, [lines])
+
   function appendLine(line: Line): void {
-    syncLines((prev) => [...prev, line])
+    setLines((prev) => [...prev, line])
   }
 
   /** 把节流缓冲的流式文本一次性提交到状态并渲染 */
@@ -76,7 +79,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     const text = streamBufRef.current
     if (!text) return
     streamBufRef.current = ""
-    syncLines((prev) => {
+    setLines((prev) => {
       const last = prev.at(-1)
       if (last && last.kind === "assistant" && last.stream) {
         const next = [...prev]
@@ -208,6 +211,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     setBusy(true)
     runningToolsRef.current = 0
     setRunningTools(0)
+    // spinner: 模型思考/无输出阶段给出可见的活动指示
+    spinnerTimerRef.current = setInterval(() => setSpinner((s) => (s + 1) % 4), 120)
     // 新一轮任务树: 根 = 用户消息, 波次是它的分支
     const root: TaskNode = { id: `run_${Date.now()}`, label: prompt, status: "done", children: [] }
     treeRef.current = root
@@ -243,6 +248,15 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     for (const pending of askQueueRef.current) pending.resolve(false)
     askQueueRef.current = []
     setAsk(null)
+    if (spinnerTimerRef.current) {
+      clearInterval(spinnerTimerRef.current)
+      spinnerTimerRef.current = null
+    }
+    // 纯问答(无工具调用)不残留空树占位
+    if (treeRef.current && treeRef.current.children.length === 0) {
+      treeRef.current = null
+      setTree(null)
+    }
     controllerRef.current = null
     setBusy(false)
     setStep(0)
@@ -264,6 +278,9 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     if (trimmed === "/reset") {
       historyRef.current = []
       setLines([])
+      treeRef.current = null
+      setTree(null)
+      setTreePrompt("")
       return
     }
     if (trimmed === "/config") {
@@ -308,6 +325,9 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
       kind: "assistant",
       text: `MiniCode · 工作目录: ${cwd} · 模型: ${process.env.LLM_MODEL ?? "默认"} · Ctrl+o 设置 / 回车提交 / Esc 中断 / /quit 退出`,
     })
+    return () => {
+      if (spinnerTimerRef.current) clearInterval(spinnerTimerRef.current)
+    }
   }, [cwd])
 
   return (
@@ -320,7 +340,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
           </Text>
         ))}
       </Box>
-      {tree && (
+      {tree && tree.children.length > 0 && (
         <Box marginTop={1}>
           <TaskTree run={{ id: 0, prompt: treePrompt, root: tree }} />
         </Box>
@@ -334,7 +354,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
       ) : (
         <Box marginTop={1} flexDirection="row">
           <Text color="gray">
-            {busy ? (runningTools > 1 ? `[${step}] ⚡并行×${runningTools}` : `[${step}]`) : ">"}{" "}
+            {busy
+              ? runningTools > 1
+                ? `[${step}] ⚡并行×${runningTools}`
+                : `[${step}] ${"⠋⠙⠹⠸"[spinner] ?? " "}`
+              : ">"}{" "}
           </Text>
           {ask ? (
             <Text color="yellow" bold>
