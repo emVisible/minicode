@@ -1,4 +1,4 @@
 node_modules/
 *.tsbuildinfo
 .out/
-.env
+.envproject_optimization_suggestions.md
