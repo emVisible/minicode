@@ -1,24 +1,24 @@
 # 交接与后续规划
 
-> 时间: 2026-08-06
+> 时间: 2026-08-06(基线) · 2026-08-06(v0.4 双引擎打通)
 > 背景: Influx(声明式计划运行时)合并入 MiniCode(对话式编码 agent),统一到本仓库。
 > 读者: 后续接手者 / 未来的自己。
+> 长期路线: 见 ROADMAP(北极星 = 双引擎一体化; 声明式计划语言为差异化灵魂)。
 
 ## 1. 当前状态
 
-MiniCode v0.3 = 对话 agent(M1 核心闭环)+ Influx 计划运行时,两个循环并存:
+MiniCode v0.4 = 对话 agent(核心闭环 + 并行工具 + 上下文压缩)+ Influx 计划运行时(计划内嵌对话已打通):
 
 | 侧 | 循环 | 入口 | 工具 |
 |---|---|---|---|
-| 对话 | `runAgent`(loop.ts): LLM 决定调工具,逐轮回环 | `minicode` TUI / `--headless` | read/write/edit/glob/grep/bash + 桥接 http_get/http_post/llm |
-| 计划 | `Runtime`(influx/core.ts): fiber 树 + reconcile diff + 波次并行 + 增量缓存 | `minicode plan run/bench/view` / `minicode mcp` | http.get/http.post/shell/write-file/read-file/list-dir/llm + registerTool |
+| 对话 | `runAgent`(loop.ts): LLM 决定调工具, 并行回环 | `minicode` TUI / `--headless` | read/write/edit/glob/grep/bash + 桥接 http_get/http_post/llm |
+| 计划 | `Runtime`(influx/core.ts): fiber 树 + reconcile diff + 波次并行 + 增量缓存 | `minicode plan run/bench/view` / `minicode mcp` | http.get/http.post/shell/write-file/read-file/list-dir/llm(含 agent 模式) + agent.* 桥接 + registerTool |
 
-所有验证全绿(合并当日实测):
+v0.4 验证全绿(实测):
 - `pnpm typecheck`(双配置)→ 0 错误
 - `pnpm smoke` → 8/8(对话侧假 LLM server 全链路)
-- `pnpm smoke:influx` → SMOKE TEST PASSED(缓存/when/阻断/fallback/retry/自动key/重复key)
-- `pnpm demo` → 并行 HTTP 3 节点 + 聚合 + 条件分支,`PASSED: total=6`
-- 旧命令 `minicode run examples/shell.plan.tsx` 兼容 ✓,`minicode mcp` 启动 ✓
+- `pnpm smoke:influx` → SMOKE TEST PASSED(含新增 llm 节点 agent 模式 tool_calls 回环断言)
+- 假 LLM server 端到端跑通 `pnpm demo:agent`(read+bash 并行回环, steps=2)
 
 ## 2. 关键设计决策(改前必读)
 
@@ -51,29 +51,38 @@ examples/*.plan.tsx      4 个可跑示例(demo/shell/fs-demo/llm-demo)
 
 ## 4. 已知限制 / 技术债
 
-- **真实 LLM 端到端未验证**: 环境无 `LLM_URL`,对话侧只有假 server 冒烟。接真实模型: 配置 `LLM_URL`/`LLM_API_KEY` 后人工验证 TUI 一轮。
-- 上下文整段回放,无压缩/截断策略(LLM_URL 稳定后可加,优先级高)。
-- 对话侧工具**顺序执行**(代码已预留并行,未实现);`loop.ts` 中 `for (const call of calls)`。
-- influx 的 `llm` 节点工具与对话侧 `llm.ts` 客户端是**两份实现**(influx 用 undici + 非流式;对话用 fetch + SSE)。合并它们(计划节点也用 `LLMClient`)是低风险重构。
-- influx `http.*` 节点失败以 throw 为语义,无 4xx 结果返回;`llm` 节点无 tool_calls 能力(只能问一次)。
+- **真实 LLM 端到端未验证**: 环境无 `LLM_URL`,对话侧与计划 agent 模式只有假 server 冒烟。接真实模型: 配置 `LLM_URL`/`LLM_API_KEY` 后人工验证 TUI 一轮 + `pnpm demo:agent`。
+- 上下文压缩是**体积截断**(丢最旧+标记),无语义摘要(摘要化列为 W2)。
+- influx 的 `llm` 节点与对话侧已共用 `LLMClient`(v0.4 合并),但 `http.*` 节点仍走 undici(与对话侧 fetch 双栈,低风险)。
+- influx `http.*` 节点失败以 throw 为语义,无 4xx 结果返回。
+- **计划侧权限模型缺失**: `plan run` 默认对 shell/write-file 与 agent.* 工具全放行(ask 默认 true)。对话侧有确认,计划侧没有 —— 权限统一是路线图 W2 项。
 - `plan view` 可视化在浏览器面板无实时进度条细节、无重连;SSE 事件不落盘。
-- MiniCode 仓库**尚无首个 commit**(git 分支 main,0 commits)。建议接手第一步就是提交基线。
+- MCP `influx_run` 无 AbortSignal/取消;状态仅进程内生命周期。
+- 两个 tsconfig 程序并存: 新计划文件必须放 `examples/`(JSX 类型冲突)。
+- `--cwd` 无等号 bug 已修复(v0.4);headless 在 TTY 下可交互确认,管道下仍默认拒绝。
 
-## 5. 后续规划(按优先级)
+## 5. 后续规划(按优先级;长期波次见 ROADMAP)
+
+### 已完成(v0.4)
+- [x] 提交首个 commit(2026-08-06 基线 `25533b8`)
+- [x] 上下文压缩(体积截断版)
+- [x] 计划内嵌对话: `llm` 节点 agent 模式(计划节点里跑 `runAgent`)
+- [x] 对话侧并行工具调用(`Promise.all`)
+- [x] 反向桥接: 对话工具进计划注册表(`agent.*`),llm 节点 tools 参数走同一份 ToolDef
+- [x] 合并两份 LLM 实现(influx llm 节点复用 `LLMClient`)
+- [x] `--cwd` 无等号 bug、headless TTY 确认、TUI 多 ask 排队
+- [x] 删除死代码(ContentDelta / LoopOutcome / 未用 StreamEvent 变体)
 
 ### P0 — 基线稳定
-- [ ] 提交首个 commit(git init 已有,仓库无历史)
-- [ ] 接真实 LLM 人工验证对话 + 计划 `llm` 节点(`pnpm demo:llm`)
-- [ ] 上下文压缩: 超长历史做摘要化或 truncate 策略(对话侧最痛的点)
+- [ ] 接真实 LLM 人工验证对话 + 计划 agent 模式(`pnpm demo:agent`)
 
-### P1 — 双循环打通(本仓库的核心价值)
-- [ ] **计划内嵌对话**: `llm` 节点升级为支持 tool_calls 的 agent 循环(计划节点里跑 `runAgent`,把对话侧能力带进声明式批处理)—— 这是"1+1>2"的关键一步
-- [ ] 对话侧并行工具调用(`Promise.all` 替换顺序 for,loop.ts 已预留)
-- [ ] `influx_plan/run` MCP 工具支持引用 MiniCode 的 agent 工具(read/write/edit/glob/grep/bash 进计划注册表,反向桥接)
+### P1 — 双循环深化(本仓库的核心价值)
+- [ ] 会话 ⇄ 计划互转: 对话导出为 plan.tsx,计划可进入对话继续演进(ROADMAP W3)
+- [ ] `influx_plan/run` MCP 工具已可引用 agent 工具(桥接完成),补 MCP 端 agent 模式 e2e 断言
 
 ### P2 — 工具层深统一(可选,回报递减)
-- [ ] 定义统一 `ToolDef`,计划工具返回对象增加 `output` 派生字段,两套注册表合并成一个
-- [ ] 风险: 会动 influx core 的 `resolveRefs`/结果提交语义与全部示例,收益主要是少一层适配。建议先做 P1,再评估。
+- [ ] 统一 `ToolDef`,计划工具返回对象增加 `output` 派生字段,两套注册表合并成一个
+- [ ] 风险: 会动 influx core 的 `resolveRefs`/结果提交语义与全部示例。v0.4 已用桥接+懒加载规避循环依赖,收益评估中。
 
 ### P3 — 工程化
 - [ ] `pnpm build`(tsc emit 或 esbuild bundle)+ bin 安装(`pnpm link`),脱离 tsx
