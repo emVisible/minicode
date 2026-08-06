@@ -13,8 +13,9 @@ import { builtinTools } from "../tools.ts"
 import { createLLMClient } from "../llm.ts"
 import { saveConfig, applyConfigToEnv, configPath } from "../config.ts"
 import { SettingsPanel } from "./settings.tsx"
+import { TaskTree, upsertWave, updateTool, markWave } from "./tree.tsx"
 import type { MinicodeConfig } from "../config.ts"
-import type { ChatMessage, LoopEvent, ToolDef } from "../types.ts"
+import type { ChatMessage, LoopEvent, TaskNode, ToolDef } from "../types.ts"
 
 interface Line {
   kind: "user" | "assistant" | "tool-start" | "tool-result" | "error"
@@ -48,6 +49,10 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   /** 并行工具计数: 显示当前同时在跑的工具数, 让并发可视化 */
   const runningToolsRef = useRef(0)
   const [runningTools, setRunningTools] = useState(0)
+  /** 当前运行的任务树(增量更新, 不重建) */
+  const treeRef = useRef<TaskNode | null>(null)
+  const [tree, setTree] = useState<TaskNode | null>(null)
+  const [treePrompt, setTreePrompt] = useState("")
 
   /** 同步更新 lines state + ref, 避免流式回调闭包读到过期数组 */
   function syncLines(updater: (prev: Line[]) => Line[]): void {
@@ -131,6 +136,12 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     { key: "llmModel", label: "Model", placeholder: "gpt-4o-mini" },
   ]
 
+  /** 触发一次树渲染(节流: 高频状态变更合并到同一帧) */
+  function bumpTree(): void {
+    const t = treeRef.current
+    if (t) setTree({ ...t, children: [...t.children] })
+  }
+
   function handleEvent(e: LoopEvent): void {
     switch (e.type) {
       case "step":
@@ -145,18 +156,48 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         }
         return
       }
-      case "tool-start":
+      case "wave-start": {
+        flushStream()
+        if (treeRef.current) {
+          upsertWave(treeRef.current, e)
+          bumpTree()
+        }
+        return
+      }
+      case "tool-start": {
         flushStream()
         runningToolsRef.current++
         setRunningTools(runningToolsRef.current)
-        appendLine({ kind: "tool-start", text: `${e.tool} ${JSON.stringify(e.args).slice(0, 200)}` })
+        if (treeRef.current) {
+          updateTool(treeRef.current, { id: e.id, tool: e.tool, status: "running" })
+          bumpTree()
+        }
         return
-      case "tool-result":
+      }
+      case "tool-result": {
         flushStream()
         runningToolsRef.current = Math.max(0, runningToolsRef.current - 1)
         setRunningTools(runningToolsRef.current)
-        appendLine({ kind: "tool-result", text: e.error ? `✗ ${e.tool}: ${e.error}` : `✓ ${e.tool}` })
+        if (treeRef.current) {
+          updateTool(treeRef.current, {
+            id: e.id,
+            tool: e.tool,
+            status: e.error ? "error" : "done",
+            ms: e.ms,
+            error: e.error,
+          })
+          bumpTree()
+        }
         return
+      }
+      case "wave-end": {
+        flushStream()
+        if (treeRef.current) {
+          markWave(treeRef.current, e.n, "done")
+          bumpTree()
+        }
+        return
+      }
       case "done":
         flushStream()
         return
@@ -167,6 +208,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     setBusy(true)
     runningToolsRef.current = 0
     setRunningTools(0)
+    // 新一轮任务树: 根 = 用户消息, 波次是它的分支
+    const root: TaskNode = { id: `run_${Date.now()}`, label: prompt, status: "done", children: [] }
+    treeRef.current = root
+    setTree({ ...root })
+    setTreePrompt(prompt)
     appendLine({ kind: "user", text: prompt })
     const controller = new AbortController()
     controllerRef.current = controller
@@ -274,6 +320,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
           </Text>
         ))}
       </Box>
+      {tree && (
+        <Box marginTop={1}>
+          <TaskTree run={{ id: 0, prompt: treePrompt, root: tree }} />
+        </Box>
+      )}
       {settingsOpen ? (
         <SettingsPanel
           draft={configDraft}

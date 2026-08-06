@@ -76,11 +76,23 @@ export interface StreamResult {
   usage: Usage
 }
 
-export interface StreamResult {
-  /** assistant 消息(含已累积文本与 tool_calls) */
-  message: ChatMessage
-  finish: StreamFinish
-  usage: Usage
+// ---------- 任务树 ----------
+// 对话侧执行的可视化数据结构: 每一轮 LLM 回复 = 一个波次(兄弟节点并行),
+// 波次间串行推进。UI 用它渲染"并行看得见"的树。
+
+export type TaskStatus = "pending" | "running" | "done" | "error"
+
+export interface TaskNode {
+  /** 稳定 id: tool_call.id 或自动生成 */
+  id: string
+  /** 工具名或描述(根/波次节点用) */
+  label: string
+  /** 执行参数(截断显示用) */
+  args?: Record<string, unknown>
+  status: TaskStatus
+  ms?: number
+  error?: string
+  children: TaskNode[]
 }
 
 // ---------- 循环 ----------
@@ -101,6 +113,8 @@ export interface LoopOptions {
 export type LoopEvent =
   | { type: "step"; n: number }
   | { type: "text"; text: string }
-  | { type: "tool-start"; tool: string; args: Record<string, unknown> }
-  | { type: "tool-result"; tool: string; error?: string }
+  | { type: "wave-start"; n: number; parallel: boolean; calls: Array<{ id: string; tool: string; args: Record<string, unknown> }> }
+  | { type: "tool-start"; id: string; tool: string; args: Record<string, unknown> }
+  | { type: "tool-result"; id: string; tool: string; ms: number; error?: string }
+  | { type: "wave-end"; n: number; ms: number }
   | { type: "done"; finish: string }

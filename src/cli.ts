@@ -58,11 +58,22 @@ function emitEvent(e: LoopEvent): void {
     case "text":
       process.stdout.write(e.text)
       return
-    case "tool-start":
-      process.stdout.write(`\n◆ ${e.tool} ${JSON.stringify(e.args)}\n`)
+    case "wave-start":
+      process.stdout.write(
+        e.parallel
+          ? `\n⚡ 波次 ${e.n} 并行执行 ${e.calls.length} 个工具:\n`
+          : `\n→ 波次 ${e.n}:\n`,
+      )
+      for (const c of e.calls) process.stdout.write(`   ${c.tool} ${JSON.stringify(c.args).slice(0, 120)}\n`)
       return
+    case "tool-start":
+      return // 已在 wave-start 中列出
     case "tool-result":
-      process.stdout.write(e.error ? `  ✗ ${e.tool}: ${e.error}\n` : `  ✓ ${e.tool}\n`)
+      process.stdout.write(
+        e.error ? `   ✗ ${e.tool} (${e.ms.toFixed(0)}ms): ${e.error.slice(0, 120)}\n` : `   ✓ ${e.tool} (${e.ms.toFixed(0)}ms)\n`,
+      )
+      return
+    case "wave-end":
       return
     case "done":
       process.stdout.write(`\n[完成 total ${e.finish}]\n`)

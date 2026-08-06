@@ -88,38 +88,63 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
       }
     }
 
-    const results = await Promise.all(
-      calls.map(async (call) => {
-        const tool = toolMap.get(call.function.name)
-        if (!tool) {
-          return `工具不存在: ${call.function.name}。可用工具: ${[...toolMap.keys()].join(", ")}`
-        }
-        let parsed: Record<string, unknown>
-        try {
-          parsed = JSON.parse(call.function.arguments || "{}")
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("参数必须是对象")
-        } catch (e) {
-          return `参数解析失败: ${String((e as Error).message)}。请重新提供合法的 JSON 参数。`
-        }
+    // 本轮所有 tool_calls 是一个"波次"(树的同一层): 兄弟节点并行执行
+    const waveStart = performance.now()
+    const callMeta = calls.map((call, i) => ({
+      call,
+      id: call.id || `call_${steps}_${i}`,
+      tool: call.function.name,
+      args: safeParseArgs(call.function.arguments),
+    }))
+    onEvent?.({
+      type: "wave-start",
+      n: steps,
+      parallel: callMeta.length > 1,
+      calls: callMeta.map(({ id, tool, args }) => ({ id, tool, args })),
+    })
 
-        onEvent?.({ type: "tool-start", tool: tool.name, args: parsed })
+    const results = await Promise.all(
+      callMeta.map(async ({ call, id, tool, args }) => {
+        const toolDef = toolMap.get(tool)
+        if (!toolDef) {
+          return { id, tool, ms: 0, error: undefined, content: `工具不存在: ${tool}。可用工具: ${[...toolMap.keys()].join(", ")}` }
+        }
+        if (args.rawError) {
+          return { id, tool, ms: 0, error: undefined, content: `参数解析失败: ${args.rawError}。请重新提供合法的 JSON 参数。` }
+        }
+        onEvent?.({ type: "tool-start", id, tool, args })
+        const t0 = performance.now()
         try {
-          const out = await tool.execute(parsed, {
+          const out = await toolDef.execute(args, {
             cwd: input.cwd,
             signal,
             ask: input.ask,
           })
-          onEvent?.({ type: "tool-result", tool: tool.name })
-          return out.output
+          const ms = performance.now() - t0
+          onEvent?.({ type: "tool-result", id, tool, ms })
+          return { id, tool, ms, error: undefined, content: out.output }
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e)
-          onEvent?.({ type: "tool-result", tool: tool.name, error: errMsg })
-          return `工具错误: ${errMsg}`
+          const ms = performance.now() - t0
+          onEvent?.({ type: "tool-result", id, tool, ms, error: errMsg })
+          return { id, tool, ms, error: errMsg, content: `工具错误: ${errMsg}` }
         }
       }),
     )
-    results.forEach((content, i) => {
-      messages.push({ role: "tool", tool_call_id: calls[i]!.id, content })
+    onEvent?.({ type: "wave-end", n: steps, ms: performance.now() - waveStart })
+    results.forEach(({ id, content }) => {
+      messages.push({ role: "tool", tool_call_id: id, content })
     })
+  }
+}
+
+/** 解析 tool_call 参数; 失败时返回 rawError 标记, 由执行方转成回喂消息 */
+function safeParseArgs(raw: string): Record<string, unknown> & { rawError?: string } {
+  try {
+    const parsed = JSON.parse(raw || "{}")
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("参数必须是对象")
+    return parsed
+  } catch (e) {
+    return { rawError: String((e as Error).message) }
   }
 }
