@@ -1,8 +1,8 @@
 {
   "name": "minicode",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Mini opencode: SSE 流式 LLM + tool-call 回环的对话式编码 agent, 内嵌 Influx 声明式计划运行时 (plan run/bench/view + MCP 编排)",
+  "description": "Mini opencode: SSE 流式 LLM + tool-call 回环的对话式编码 agent, 内嵌 Influx 声明式计划运行时 (plan run/bench/view + MCP 编排), 支持计划内嵌对话(llm 节点 agent 模式)",
   "bin": {
     "minicode": "src/cli.ts"
   },
@@ -18,6 +18,7 @@
     "demo:shell": "tsx src/cli.ts plan run examples/shell.plan.tsx",
     "demo:fs": "tsx src/cli.ts plan run examples/fs-demo.plan.tsx",
     "demo:llm": "tsx src/cli.ts plan run examples/llm-demo.plan.tsx",
+    "demo:agent": "tsx src/cli.ts plan run examples/agent-demo.plan.tsx",
     "bench": "tsx src/cli.ts plan bench examples/demo.plan.tsx",
     "webui": "tsx src/cli.ts plan view examples/demo.plan.tsx",
     "webui:shell": "tsx src/cli.ts plan view examples/shell.plan.tsx",

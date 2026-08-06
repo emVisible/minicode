@@ -11,12 +11,15 @@ import { z } from "zod"
 import { Runtime, planFromSpec } from "./core.ts"
 import type { RunReport } from "./core.ts"
 import { getTool, listTools } from "./tools.ts"
+import { ensureAgentTools } from "./agent-tools.ts"
 import { pathToFileURL } from "node:url"
 import { resolve } from "node:path"
 
+await ensureAgentTools()
+
 let rt = new Runtime(getTool)
 
-const server = new McpServer({ name: "influx", version: "0.1.0" })
+const server = new McpServer({ name: "influx", version: "0.4.0" })
 
 const specSchema = z
   .any()

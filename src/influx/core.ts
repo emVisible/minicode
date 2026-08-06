@@ -59,6 +59,10 @@ export type ToolRun = (params: Record<string, any>, ctx: ToolCtx) => Promise<unk
 export interface ToolCtx {
   results: Record<string, unknown>
   errors: Record<string, string>
+  /** 工作目录(代理给 agent 工具时使用) */
+  cwd: string
+  /** 写类/命令类工具的确认回调(计划侧默认放行, 由 CLI/MCP 注入) */
+  ask: (req: { tool: string; summary: string }) => Promise<boolean>
 }
 
 export type FiberStatus = "placement" | "update" | "skip" | "blocked"
@@ -134,6 +138,8 @@ export interface RuntimeOptions {
   serial?: boolean
   maxIter?: number
   onEvent?: (e: RuntimeEvent) => void
+  cwd?: string
+  ask?: (req: { tool: string; summary: string }) => Promise<boolean>
 }
 
 // ---------- 调度器 ----------
@@ -161,13 +167,13 @@ export class Runtime {
   }
 
   async run(plan: unknown, opts: RuntimeOptions = {}): Promise<RunReport> {
-    const { serial = false, maxIter = 8, onEvent } = opts
+    const { serial = false, maxIter = 8, onEvent, cwd = process.cwd(), ask = async () => true } = opts
     this.waves = []
     this.stats = { placed: 0, updated: 0, skipped: 0, blocked: 0, errors: 0 }
     this.lastCached = []
     this.errors = {}
     this.blocked = {}
-    const ctx = { results: this.results, errors: this.errors }
+    const ctx: ToolCtx = { results: this.results, errors: this.errors, cwd, ask }
     // 静态计划(非函数)一次 render 即可收敛; 函数计划随状态重渲染直到稳定
     const maxLoop = typeof plan === "function" ? maxIter : 1
 
@@ -180,7 +186,7 @@ export class Runtime {
       const changed = this.reconcile(fibers)
       if (!changed) break
       onEvent?.({ type: "reconcile", stats: { ...this.stats } })
-      await this.runWaves(fibers, serial, onEvent)
+      await this.runWaves(fibers, serial, ctx, onEvent)
       for (const f of fibers) {
         if (!this.fiberInfo.has(f.key)) {
           this.fiberInfo.set(f.key, { status: f.status, ms: f.ms, executed: f.executed })
@@ -192,7 +198,12 @@ export class Runtime {
 
   // 干跑预览: 不执行任何工具, 用与 run 相同的完整判定(含依赖传播)输出影响面
   async preview(plan: unknown): Promise<{ nodes: PreviewNode[] }> {
-    const ctx = { results: this.results, errors: this.errors }
+    const ctx: ToolCtx = {
+      results: this.results,
+      errors: this.errors,
+      cwd: process.cwd(),
+      ask: async () => true,
+    }
     const element = typeof plan === "function" ? (plan as any)(this.store) : plan
     const tree = buildElement(element, null, ctx)
     const fibers = collect(tree)
@@ -267,6 +278,7 @@ export class Runtime {
   private async runWaves(
     fibers: Fiber[],
     serial: boolean,
+    ctx: ToolCtx,
     onEvent?: (e: RuntimeEvent) => void,
   ): Promise<void> {
     while (true) {
@@ -320,7 +332,7 @@ export class Runtime {
             let lastErr: unknown
             for (let attempt = 0; attempt <= retries; attempt++) {
               try {
-                f.result = await this.getTool(f.tool)(resolved, state)
+                f.result = await this.getTool(f.tool)(resolved, ctx)
                 lastErr = undefined
                 break
               } catch (e) {

@@ -103,12 +103,33 @@ console.log("reset 后重跑(应全 placement):", r7.structuredContent.stats)
 // ---------- 内置文件工具 + llm 智能节点 ----------
 
 // 本地假 LLM 服务, 验证 llm → write-file → read-file 链接
+// 同时支持 agent 模式: 用户消息含 "agent-task" 且尚无 tool 回执时返回 read tool_call, 否则返回最终文本
 const llmServer = createServer((req, res) => {
   let raw = ""
   req.on("data", (c) => (raw += c))
   req.on("end", () => {
+    const body = JSON.parse(raw)
+    const msgs = body.messages ?? []
+    const isAgentTask = msgs.some((m: any) => m.role === "user" && String(m.content).includes("agent-task"))
+    const hasToolReply = msgs.some((m: any) => m.role === "tool")
+    let message: any
+    if (isAgentTask && !hasToolReply) {
+      message = {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call_agent_read",
+            type: "function",
+            function: { name: "read", arguments: JSON.stringify({ path: join(TMP, "influx-smoke/from-llm.md") }) },
+          },
+        ],
+      }
+    } else {
+      message = { role: "assistant", content: "fake-llm-answer:" + raw.length }
+    }
     res.writeHead(200, { "content-type": "application/json" })
-    res.end(JSON.stringify({ choices: [{ message: { content: "fake-llm-answer:" + raw.length } }] }))
+    res.end(JSON.stringify({ choices: [{ message }] }))
   })
 })
 await new Promise<void>((r) => llmServer.listen(0, r))
@@ -134,6 +155,33 @@ const chainSpec = {
 const rf: any = await client.callTool({ name: "influx_run", arguments: { spec: chainSpec } })
 const check = rf.structuredContent.results.check
 console.log("llm→write→read:", JSON.stringify(check.content), "| list:", JSON.stringify(rf.structuredContent.results.ls.files))
+
+// ---------- llm 节点 agent 模式: 计划内嵌对话(tool_calls 回环) ----------
+
+const agentSpec = {
+  type: "flow",
+  key: "af",
+  children: [
+    {
+      type: "task",
+      key: "agent",
+      tool: "llm",
+      params: { prompt: "agent-task: 读取文件并总结", url: llmUrl, tools: ["read"], maxSteps: 5 },
+    },
+  ],
+}
+const ra: any = await client.callTool({ name: "influx_run", arguments: { spec: agentSpec } })
+const agentRes = ra.structuredContent.results.agent
+console.log(
+  "llm agent 模式: answer=", JSON.stringify(agentRes?.answer),
+  "| steps=", JSON.stringify(agentRes?.steps),
+  "| finish=", JSON.stringify(agentRes?.finish),
+)
+console.log(
+  "agent 模式断言:",
+  !agentRes || !agentRes.answer ? "FAIL" :
+  agentRes.answer.includes("fake-llm-answer") && agentRes.steps >= 2 ? "ok" : "FAIL",
+)
 
 // ---------- 错误阻断 + fallback ----------
 

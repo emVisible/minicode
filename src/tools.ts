@@ -325,7 +325,12 @@ const editTool: ToolDef = {
 // ---------- influx 桥接(http.get / http.post / llm) ----------
 // 复用 Influx 计划运行时的远端 HTTP 与 LLM 节点工具, 返回结构化结果转成文本回喂模型
 
-const influxEmptyCtx = { results: {}, errors: {} }
+const influxEmptyCtx = {
+  results: {},
+  errors: {},
+  cwd: process.cwd(),
+  ask: async () => true,
+}
 
 function influxTool(name: string, description: string, parameters: Record<string, unknown>): ToolDef {
   return {

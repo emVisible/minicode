@@ -6,6 +6,7 @@ import { exec as execCb } from "node:child_process"
 import { promisify } from "node:util"
 import { Agent, request as uRequest } from "undici"
 import type { ToolCtx } from "./core.ts"
+import { createLLMClient, resolveEndpoint } from "../llm.ts"
 
 type ToolImpl = (params: Record<string, any>, ctx: ToolCtx) => Promise<unknown>
 
@@ -136,35 +137,58 @@ registerTool(
 )
 
 // ---------- LLM 智能节点 ----------
-// 端点解析顺序: url 参数 > LLM_URL 环境变量(host 注入) > API_URL; 鉴权: LLM_API_KEY / API_KEY
+// 统一使用 src/llm.ts 的 LLMClient(与对话侧同一实现: SSE 流式/重试/超时/中断)。
+// 两种模式:
+//   1. 单问模式(默认): 一次 prompt 得到 {answer}
+//   2. agent 模式: 传 tools 数组, 节点内跑完整 tool-call 回环(计划内嵌对话)
+
+let agentLoop: ((opts: {
+  prompt: string
+  system?: string
+  model?: string
+  temperature?: number
+  url?: string
+  timeoutMs?: number
+  tools: string[]
+  maxSteps?: number
+  ctx: ToolCtx
+}) => Promise<unknown>) | null = null
+
+// 延迟加载, 避免与 src/tools.ts 形成循环依赖(对话工具注册表引用本模块的 getTool)
+async function getAgentLoop() {
+  if (!agentLoop) {
+    const mod = await import("./agent-loop.ts")
+    agentLoop = mod.runAgentLoop
+  }
+  return agentLoop
+}
 
 registerTool(
   "llm",
-  async ({ prompt, system, model, temperature = 0.2, url, timeoutMs = 120000 }) => {
+  async ({ prompt, system, model, temperature = 0.2, url, timeoutMs = 120000, tools, maxSteps }, ctx) => {
     if (!prompt) throw new Error("[llm] 缺少 prompt")
-    const base = url ?? process.env.LLM_URL ?? process.env.API_URL
-    if (!base) throw new Error("[llm] 未配置 LLM_URL, 请传 url 参数或在 host 环境注入 LLM_URL")
-    const endpoint = base.endsWith("/chat/completions") ? base : base.replace(/\/+$/, "") + "/chat/completions"
-    const key = process.env.LLM_API_KEY ?? process.env.API_KEY
-    const body = {
-      model: model ?? process.env.LLM_MODEL ?? "gpt-4o-mini",
-      temperature,
-      messages: [
-        ...(system ? [{ role: "system", content: system }] : []),
-        { role: "user", content: prompt },
-      ],
+    const client = createLLMClient({ endpoint: url ? resolveEndpoint(url) : undefined, timeoutMs })
+
+    // agent 模式: 计划节点内嵌完整 agent 循环(tool_calls)
+    if (tools?.length) {
+      const loop = await getAgentLoop()
+      return loop({ prompt, system, model, temperature, url, timeoutMs, tools, maxSteps, ctx })
     }
-    const res = await request("POST", {
-      url: endpoint,
-      headers: key ? { Authorization: `Bearer ${key}` } : {},
-      body,
-      timeoutMs,
+
+    // 单问模式: 复用与对话侧完全相同的流式客户端
+    const res = await client.stream({
+      messages: [
+        ...(system ? [{ role: "system" as const, content: system }] : []),
+        { role: "user" as const, content: prompt },
+      ],
+      tools: [],
+      model,
+      temperature,
     })
-    const content = (res.body as any)?.choices?.[0]?.message?.content
-    if (typeof content !== "string") throw new Error("[llm] 响应缺少 choices[0].message.content")
-    return { answer: content }
+    if (res.message.tool_calls?.length) throw new Error("[llm] 意外收到 tool_calls(未传 tools)")
+    return { answer: res.message.content }
   },
-  "LLM 生成节点(OpenAI 兼容 chat/completions), 参数: prompt(必填), system, model, temperature, url, timeoutMs; 返回 {answer}",
+  "LLM 节点(OpenAI 兼容 chat/completions, 与对话侧共用 LLMClient)。参数: prompt(必填), system, model, temperature, url, timeoutMs; 传 tools(数组, 内置 agent 工具名) 则进入 agent 模式, 节点内跑 tool-call 回环并返回 {answer, steps, finish}; 否则返回 {answer}",
 )
 
 function truncate(s: string, n = 200): string {

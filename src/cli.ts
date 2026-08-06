@@ -26,11 +26,17 @@ interface CliFlags {
 function parseArgs(argv: string[]): { flags: CliFlags; promptArgs: string[] } {
   const flags: CliFlags = { headless: false, yes: false, cwd: process.cwd() }
   const promptArgs: string[] = []
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
     if (arg === "--headless") flags.headless = true
     else if (arg === "--yes") flags.yes = true
-    else if (arg === "--cwd") flags.cwd = process.cwd()
-    else if (arg.startsWith("--cwd=")) flags.cwd = arg.slice("--cwd=".length)
+    else if (arg === "--cwd") {
+      const next = argv[i + 1]
+      if (next !== undefined && !next.startsWith("--")) {
+        flags.cwd = next
+        i++
+      }
+    } else if (arg.startsWith("--cwd=")) flags.cwd = arg.slice("--cwd=".length)
     else if (arg.startsWith("--model=")) flags.model = arg.slice("--model=".length)
     else promptArgs.push(arg)
   }
@@ -116,6 +122,20 @@ async function runAgentOnce(flags: CliFlags, rawPrompt: string): Promise<void> {
     requests: (opts) => client.stream(opts),
     ask: ({ tool, summary }) => {
       if (flags.yes) return Promise.resolve(true)
+      // 交互 TTY 下从 stdin 读一行确认; 管道/脚本场景无法交互 → 默认拒绝
+      if (process.stdin.isTTY) {
+        return new Promise<boolean>((resolve) => {
+          process.stdout.write(`\n? 允许 ${tool}(${summary})? [y/N] `)
+          process.stdin.setEncoding("utf8")
+          process.stdin.resume()
+          const onData = (chunk: string) => {
+            process.stdin.pause()
+            process.stdin.off("data", onData)
+            resolve(/^\s*y(es)?\s*$/i.test(chunk.trim()))
+          }
+          process.stdin.once("data", onData)
+        })
+      }
       process.stdout.write(`\n? 允许 ${tool}(${summary})? 使用 --yes 放行 [y/N] → 默认拒绝\n`)
       return Promise.resolve(false)
     },

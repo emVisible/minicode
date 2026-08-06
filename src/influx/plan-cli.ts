@@ -10,6 +10,7 @@ import { promisify } from "node:util"
 import { Runtime } from "./core.ts"
 import type { Fiber, RunReport } from "./core.ts"
 import { getTool } from "./tools.ts"
+import { ensureAgentTools } from "./agent-tools.ts"
 
 const execAsync = promisify(execCb)
 const here = dirname(fileURLToPath(import.meta.url))
@@ -43,6 +44,7 @@ async function loadPlan(file: string): Promise<unknown> {
 
 export async function runPlanFile(file: string, flags: PlanCliFlags): Promise<void> {
   const plan = await loadPlan(file)
+  await ensureAgentTools()
   const rt = new Runtime(getTool)
   const t0 = performance.now()
   const rep = await rt.run(plan, { serial: flags.serial, maxIter: flags.maxIter })

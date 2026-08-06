@@ -52,10 +52,7 @@ export interface ToolDef extends ToolSpec {
 
 export type StreamFinish = "stop" | "tool_calls" | "length" | "content_filter" | "error" | "aborted"
 
-export type StreamEvent =
-  | { type: "text-delta"; text: string }
-  | { type: "tool-call"; call: ToolCall }
-  | { type: "finish"; finish: StreamFinish; usage?: Usage }
+export type StreamEvent = { type: "text-delta"; text: string }
 
 export interface Usage {
   inputTokens: number
@@ -79,15 +76,11 @@ export interface StreamResult {
   usage: Usage
 }
 
-/** chunk.delta 解析出的片段(供聚合器内部使用) */
-export interface ContentDelta {
-  content?: string
-  tool_calls?: Array<{
-    index: number
-    id?: string
-    type?: string
-    function?: { name?: string; arguments?: string }
-  }>
+export interface StreamResult {
+  /** assistant 消息(含已累积文本与 tool_calls) */
+  message: ChatMessage
+  finish: StreamFinish
+  usage: Usage
 }
 
 // ---------- 循环 ----------
@@ -111,9 +104,3 @@ export type LoopEvent =
   | { type: "tool-start"; tool: string; args: Record<string, unknown> }
   | { type: "tool-result"; tool: string; error?: string }
   | { type: "done"; finish: string }
-
-export interface LoopOutcome {
-  finish: string
-  steps: number
-  messages: ChatMessage[]
-}

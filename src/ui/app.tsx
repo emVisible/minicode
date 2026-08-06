@@ -34,7 +34,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const linesRef = useRef<Line[]>([])
   const historyRef = useRef<ChatMessage[]>([])
   const controllerRef = useRef<AbortController | null>(null)
-  const askRef = useRef<{ resolve: (v: boolean) => void } | null>(null)
+  const askQueueRef = useRef<Array<{ req: { tool: string; summary: string }; resolve: (v: boolean) => void }>>([])
 
   /** 同步更新 lines state + ref, 避免流式回调闭包读到过期数组 */
   function syncLines(updater: (prev: Line[]) => Line[]): void {
@@ -47,6 +47,20 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
 
   function appendLine(line: Line): void {
     syncLines((prev) => [...prev, line])
+  }
+
+  /** 权限确认队列: 并行工具调用可能同时触发多个 ask, 逐个展示 */
+  function queueAsk(req: { tool: string; summary: string }): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      askQueueRef.current.push({ req, resolve })
+      if (!ask) setAsk(askQueueRef.current[0]!.req)
+    })
+  }
+
+  function settleAsk(allow: boolean): void {
+    const cur = askQueueRef.current.shift()
+    cur?.resolve(allow)
+    setAsk(askQueueRef.current[0]?.req ?? null)
   }
 
   function handleEvent(e: LoopEvent): void {
@@ -93,11 +107,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         maxSteps: 30,
         signal: controller.signal,
         requests: (opts) => client.stream(opts),
-        ask: (req) =>
-          new Promise<boolean>((resolve) => {
-            askRef.current = { resolve }
-            setAsk(req)
-          }),
+        ask: queueAsk,
         onEvent: handleEvent,
       })
       historyRef.current = result.messages
@@ -107,6 +117,10 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     } catch (e) {
       appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
     }
+    // 清空未决的权限确认(中断/异常时不能让 Promise 悬空)
+    for (const pending of askQueueRef.current) pending.resolve(false)
+    askQueueRef.current = []
+    setAsk(null)
     controllerRef.current = null
     setBusy(false)
     setStep(0)
@@ -115,11 +129,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   function submit(value: string): void {
     const trimmed = value.trim()
     // 权限确认挂起时, 输入 y/n 放行或拒绝
-    if (askRef.current) {
-      const a = askRef.current
-      askRef.current = null
-      setAsk(null)
-      a.resolve(trimmed.toLowerCase() === "y" || trimmed.toLowerCase() === "yes")
+    if (ask) {
+      settleAsk(trimmed.toLowerCase() === "y" || trimmed.toLowerCase() === "yes")
       setInput("")
       return
     }

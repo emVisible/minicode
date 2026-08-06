@@ -6,6 +6,30 @@ import type { ChatMessage, LoopEvent, LoopOptions, ToolSpec } from "./types.ts"
 
 const DEFAULT_MAX_STEPS = 30
 const DOOM_LOOP_THRESHOLD = 3
+/** 单次请求的上下文预算; 超限时丢弃最旧的非 system 消息 */
+const MAX_CONTEXT_BYTES = 128 * 1024
+
+/** 上下文压缩: 序列化体积超预算时, 保留 system + 最新消息, 丢弃最旧消息并注入截断标记 */
+function compactMessages(messages: ChatMessage[]): ChatMessage[] {
+  const size = () => JSON.stringify(messages).length
+  if (size() <= MAX_CONTEXT_BYTES) return messages
+
+  const out = [...messages]
+  while (out.length > 0 && size() > MAX_CONTEXT_BYTES) {
+    const i = out.findIndex((m) => m.role !== "system")
+    if (i === -1) break
+    out.splice(i, 1)
+  }
+
+  const dropped = messages.length - out.length
+  if (dropped > 0) {
+    out.push({
+      role: "system",
+      content: `[上下文截断] 因体积超限已丢弃最早 ${dropped} 条消息, 保留最近 ${out.length} 条。`,
+    })
+  }
+  return out
+}
 
 /** 循环输入: 一次 runAgent 调用处理一条 user 消息及其后续所有工具回环 */
 export type RunInput = LoopOptions & {
@@ -35,7 +59,7 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
     onEvent?.({ type: "step", n: steps })
 
     const req = await input.requests({
-      messages: [{ role: "system", content: input.system }, ...messages],
+      messages: [{ role: "system", content: input.system }, ...compactMessages(messages)],
       tools: specs,
       signal,
       onEvent: (e) => {
@@ -64,43 +88,38 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
       }
     }
 
-    for (const call of calls) {
-      const tool = toolMap.get(call.function.name)
-      if (!tool) {
-        messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: `工具不存在: ${call.function.name}。可用工具: ${[...toolMap.keys()].join(", ")}`,
-        })
-        continue
-      }
-      let parsed: Record<string, unknown>
-      try {
-        parsed = JSON.parse(call.function.arguments || "{}")
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("参数必须是对象")
-      } catch (e) {
-        messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: `参数解析失败: ${String((e as Error).message)}。请重新提供合法的 JSON 参数。`,
-        })
-        continue
-      }
+    const results = await Promise.all(
+      calls.map(async (call) => {
+        const tool = toolMap.get(call.function.name)
+        if (!tool) {
+          return `工具不存在: ${call.function.name}。可用工具: ${[...toolMap.keys()].join(", ")}`
+        }
+        let parsed: Record<string, unknown>
+        try {
+          parsed = JSON.parse(call.function.arguments || "{}")
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("参数必须是对象")
+        } catch (e) {
+          return `参数解析失败: ${String((e as Error).message)}。请重新提供合法的 JSON 参数。`
+        }
 
-      onEvent?.({ type: "tool-start", tool: tool.name, args: parsed })
-      try {
-        const out = await tool.execute(parsed, {
-          cwd: input.cwd,
-          signal,
-          ask: input.ask,
-        })
-        messages.push({ role: "tool", tool_call_id: call.id, content: out.output })
-        onEvent?.({ type: "tool-result", tool: tool.name })
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : String(e)
-        messages.push({ role: "tool", tool_call_id: call.id, content: `工具错误: ${errMsg}` })
-        onEvent?.({ type: "tool-result", tool: tool.name, error: errMsg })
-      }
-    }
+        onEvent?.({ type: "tool-start", tool: tool.name, args: parsed })
+        try {
+          const out = await tool.execute(parsed, {
+            cwd: input.cwd,
+            signal,
+            ask: input.ask,
+          })
+          onEvent?.({ type: "tool-result", tool: tool.name })
+          return out.output
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e)
+          onEvent?.({ type: "tool-result", tool: tool.name, error: errMsg })
+          return `工具错误: ${errMsg}`
+        }
+      }),
+    )
+    results.forEach((content, i) => {
+      messages.push({ role: "tool", tool_call_id: calls[i]!.id, content })
+    })
   }
 }
