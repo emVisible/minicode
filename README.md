@@ -22,8 +22,10 @@ Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式
 - **内置工具**(`src/tools.ts`): `read` / `write` / `edit` / `glob` / `grep` / `bash` / `http_get` / `http_post` / `llm`
   - 读类( read / glob / grep / http_get / http_post )默认放行;写类(write / edit)与命令(bash)触发确认(并行多工具时逐个排队确认)
   - 输出截断( read 50KB / bash 4000 字符 / grep 200 条 )
-- **界面**: 交互式 Ink TUI(输入框、流式文本渲染[30ms 批量节流, 长会话不卡顿]、工具调用状态、权限确认队列、Esc 中断),以及 headless 模式(管道/stdin 单轮,TTY 下可交互确认)
+- **界面**: 交互式 Ink TUI(输入框、流式文本渲染[30ms 批量节流]、权限确认队列[输入框保持可用, 输入 y 放行]、Esc 中断),以及 headless 模式(管道/stdin 单轮,TTY 下可交互确认)
+  - **组合式布局**: 左对话流 + 右任务树侧边栏, 各组件独立负责、组合拼接
   - **任务树视图**: 对话执行渲染为树 —— 用户消息(根)→ 每轮波次(分支)→ 工具调用(同层兄弟=并行),状态符号 ○/◐/✓/✗ + 颜色区分,并行波次标注 `波次 N · M 并行`,执行过程"看得见"
+  - **`/plan <任务>`**: 让 LLM 把任务拆解为 DAG 计划, 交给 Influx 运行时**全并行执行**(无依赖节点同波并行, 依赖链自动串行) —— 对话理解 + 计划执行的"1+1>2"
   - **内置设置面板**: TUI 内 `Ctrl+o`(或 `/config`)呼出,配置 LLM URL / API Key / Model,Enter 保存即生效并持久化到 `~/.minicode/config.json`(0600 权限,原子写);环境变量优先于配置文件
 - **终结条件**: stop(完成) / aborted(用户中断) / max_steps / doom_loop
 
@@ -96,6 +98,7 @@ src/
     tools.ts         计划节点工具注册表
     agent-loop.ts    llm 节点 agent 模式: 计划内嵌对话(runAgent 回环)
     agent-tools.ts   反向桥接: 对话工具 → 计划注册表(agent.*)
+    plan-runner.ts   对话内全并行执行(/plan: LLM 生成 DAG → Runtime 全并行)
     plan-cli.ts      plan run/bench/view 实现(可调用模块)
     mcp.ts           MCP 服务器
     jsx.d.ts         计划文件 JSX 类型

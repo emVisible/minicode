@@ -262,6 +262,88 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     setStep(0)
   }
 
+  /** /plan: 让 LLM 生成 DAG 计划, 交给 Influx 全并行执行(跨波次全并行) */
+  async function runPlan(task: string): Promise<void> {
+    setBusy(true)
+    setInput("")
+    appendLine({ kind: "user", text: `/plan ${task}` })
+    appendLine({ kind: "tool-start", text: "计划生成中…(LLM 拆解 DAG)" })
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const { runPlannedTask, renderSpec } = await import("../influx/plan-runner.ts")
+
+    const root: TaskNode = { id: `plan_${Date.now()}`, label: task, status: "done", children: [] }
+    treeRef.current = root
+    setTree({ ...root })
+    setTreePrompt(`/plan ${task}`)
+    // Runtime 事件无波次号, 用事件顺序推断: wave-start 开启新波次, node-start 属于当前波次
+    let currentWave = 0
+
+    try {
+      const result = await runPlannedTask(task, {
+        cwd,
+        ask: queueAsk,
+        onPlan: (spec) => {
+          appendLine({ kind: "tool-result", text: `计划生成: ${renderSpec(spec).split("\n").length} 个节点` })
+        },
+        onEvent: (e) => {
+          switch (e.type) {
+            case "wave-start": {
+              currentWave = e.n
+              if (treeRef.current) {
+                upsertWave(treeRef.current, { n: e.n, parallel: e.parallel, calls: [] })
+                bumpTree()
+              }
+              break
+            }
+            case "node-start": {
+              if (treeRef.current) {
+                upsertWave(treeRef.current, { n: currentWave, parallel: true, calls: [] })
+                const wave = treeRef.current.children.find((c) => c.id === `wave_${currentWave}`)
+                if (wave && !wave.children.some((c) => c.id === e.key)) {
+                  wave.children.push({ id: e.key, label: e.tool, status: "running", children: [] })
+                }
+                bumpTree()
+              }
+              break
+            }
+            case "node-end": {
+              if (treeRef.current) {
+                const wave = treeRef.current.children.find((c) => c.id === `wave_${currentWave}`)
+                const node = wave?.children.find((c) => c.id === e.key)
+                if (node) {
+                  node.status = e.error ? "error" : "done"
+                  node.ms = e.ms
+                  if (e.error) node.error = e.error
+                }
+                if (wave && wave.children.length && wave.children.every((c) => c.status !== "running")) {
+                  wave.status = "done"
+                }
+                bumpTree()
+              }
+              break
+            }
+            case "wave-end": {
+              if (treeRef.current) {
+                const wave = treeRef.current.children.find((c) => c.id === `wave_${currentWave}`)
+                if (wave) wave.status = "done"
+                bumpTree()
+              }
+              break
+            }
+          }
+        },
+      })
+      appendLine({ kind: result.ok ? "tool-result" : "error", text: result.message })
+    } catch (e) {
+      appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
+    }
+    controllerRef.current = null
+    setBusy(false)
+    setStep(0)
+    flushStream()
+  }
+
   function submit(value: string): void {
     const trimmed = value.trim()
     // 权限确认挂起时, 输入 y/n 放行或拒绝
@@ -286,6 +368,15 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     if (trimmed === "/config") {
       openConfig()
       setInput("")
+      return
+    }
+    if (trimmed.startsWith("/plan")) {
+      const task = trimmed.slice(5).trim()
+      if (!task) {
+        appendLine({ kind: "error", text: "用法: /plan <任务描述> — 让 LLM 生成计划并全并行执行" })
+        return
+      }
+      void runPlan(task)
       return
     }
     if (busy) {
@@ -323,7 +414,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   useEffect(() => {
     appendLine({
       kind: "assistant",
-      text: `MiniCode · 工作目录: ${cwd} · 模型: ${process.env.LLM_MODEL ?? "默认"} · Ctrl+o 设置 / 回车提交 / Esc 中断 / /quit 退出`,
+      text: `MiniCode · ${cwd} · ${process.env.LLM_MODEL ?? "默认"} · Ctrl+o 设置 / /quit 退出`,
     })
     return () => {
       if (spinnerTimerRef.current) clearInterval(spinnerTimerRef.current)
@@ -332,19 +423,22 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
 
   return (
     <Box flexDirection="column" width="100%">
-      <Box flexDirection="column" alignItems="flex-start">
-        {lines.map((line, i) => (
-          <Text key={i} color={colorFor(line.kind)}>
-            {prefixFor(line.kind)}
-            {line.text}
-          </Text>
-        ))}
-      </Box>
-      {tree && tree.children.length > 0 && (
-        <Box marginTop={1}>
-          <TaskTree run={{ id: 0, prompt: treePrompt, root: tree }} />
+      {/* 组合式布局: 上部 = 对话流 + 树侧边栏; 下部 = 输入行 */}
+      <Box flexDirection="row" width="100%">
+        <Box flexDirection="column" alignItems="flex-start" flexGrow={1} width="50%">
+          {lines.map((line, i) => (
+            <Text key={i} color={colorFor(line.kind)}>
+              {prefixFor(line.kind)}
+              {line.text}
+            </Text>
+          ))}
         </Box>
-      )}
+        {tree && tree.children.length > 0 && (
+          <Box marginLeft={2} width="50%" flexShrink={0}>
+            <TaskTree run={{ id: 0, prompt: treePrompt, root: tree }} />
+          </Box>
+        )}
+      </Box>
       {settingsOpen ? (
         <SettingsPanel
           draft={configDraft}
@@ -360,24 +454,22 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
                 : `[${step}] ${"⠋⠙⠹⠸"[spinner] ?? " "}`
               : ">"}{" "}
           </Text>
-          {ask ? (
-            <Text color="yellow" bold>
-              允许 {ask.tool}? {ask.summary} (y=放行 / 其他=拒绝)
-            </Text>
-          ) : (
-            <TextInput
-              value={input}
-              focus
-              placeholder={busy ? "运行中…(Esc 中断)" : "输入指令"}
-              onChange={setInput}
-              onSubmit={submit}
-            />
-          )}
+          {/* ask 时输入框保持可用: 提交走 submit() 的 ask 分支 */}
+          <TextInput
+            value={input}
+            focus
+            placeholder={
+              ask
+                ? `允许 ${ask.tool}? ${ask.summary} — 输入 y 放行 / 其他拒绝`
+                : busy
+                  ? "运行中…(Esc 中断)"
+                  : "输入指令"
+            }
+            onChange={setInput}
+            onSubmit={submit}
+          />
         </Box>
       )}
-      <Box marginTop={1}>
-        <Text color="gray">Ctrl+o 设置 · /config 设置 · /quit 退出 · /reset 清空</Text>
-      </Box>
     </Box>
   )
 }

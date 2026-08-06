@@ -1,0 +1,127 @@
+// 对话内全并行计划执行 —— /plan 命令的引擎
+// 用户给一段任务描述 → LLM 生成 Influx 计划 spec(声明式 DAG, 无依赖分支可任意并行)
+// → 交给 Runtime 全并行执行(波次调度), 事件桥接到对话 UI 的任务树。
+//
+// 这是"双引擎一体化"的关键路径: 对话负责理解任务, Influx 负责全并行执行。
+
+import { Runtime, planFromSpec } from "./core.ts"
+import type { RuntimeEvent } from "./core.ts"
+import { getTool } from "./tools.ts"
+import { createLLMClient, resolveEndpoint } from "../llm.ts"
+
+export interface PlanRunResult {
+  ok: boolean
+  waves: number
+  stats: { placed: number; updated: number; skipped: number; blocked: number; errors: number }
+  /** 每个节点结果(结构化), 供回喂模型/展示 */
+  results: Record<string, unknown>
+  errors: Record<string, string>
+  blocked: Record<string, string>
+  message: string
+}
+
+/**
+ * 用 LLM 生成计划 spec 并全并行执行。
+ * @param task 用户任务描述
+ * @param onPlan spec 生成后回调(供 UI 预览/记录)
+ * @param onEvent Runtime 事件(供任务树实时渲染)
+ */
+export async function runPlannedTask(
+  task: string,
+  opts: {
+    model?: string
+    url?: string
+    onPlan?: (spec: unknown) => void
+    onEvent?: (e: RuntimeEvent) => void
+    ask?: (req: { tool: string; summary: string }) => Promise<boolean>
+    cwd?: string
+  } = {},
+): Promise<PlanRunResult> {
+  const client = createLLMClient({ endpoint: opts.url ? resolveEndpoint(opts.url) : undefined })
+  const spec = await generatePlanSpec(client, task, opts.model)
+  opts.onPlan?.(spec)
+
+  const rt = new Runtime(getTool)
+  const plan = planFromSpec(spec)
+  const rep = await rt.run(plan, {
+    cwd: opts.cwd ?? process.cwd(),
+    ask: opts.ask ?? (async () => true),
+    onEvent: opts.onEvent,
+  })
+  const failed = Object.keys(rt.errors).length + Object.keys(rt.blocked).length
+  return {
+    ok: failed === 0,
+    waves: rep.waves.length,
+    stats: rep.stats,
+    results: rt.results,
+    errors: rt.errors,
+    blocked: rt.blocked,
+    message: `计划执行完成: ${rep.waves.length} 波, placement ${rep.stats.placed}, cached ${rep.stats.skipped}, 失败 ${failed}`,
+  }
+}
+
+/**
+ * 让 LLM 把任务描述转成 Influx 计划 spec(JSON)。
+ * 要求: 只输出 JSON; 节点是独立的可并行单元; 依赖用 dependsOn 声明;
+ * 工具名限制为 influx 内置(详见 system 提示)。
+ */
+async function generatePlanSpec(
+  client: ReturnType<typeof createLLMClient>,
+  task: string,
+  model?: string,
+): Promise<unknown> {
+  const system = [
+    "你是计划生成器。把用户任务拆解为 Influx 计划(JSON spec), 只输出 JSON, 不要任何解释。",
+    "spec 结构: { type:'flow', key:'root', children:[{type:'task', key:'k1', tool:'<tool>', params:{...}, dependsOn:['k2']}] }",
+    "规则:",
+    "- 把任务拆成 3-8 个可独立执行的节点; 无依赖的节点不要互相 dependsOn(它们会全并行执行)",
+    "- 只有真实数据依赖才用 dependsOn(如: 先读文件再基于内容写文件)",
+    "- 可用工具: shell(执行命令, params:{cmd}), read-file(params:{path}), write-file(params:{path,content}),",
+    "  list-dir(params:{path}), http.get(params:{url}), http.post(params:{url,body}), llm(params:{prompt})",
+    "- write-file 的 content 可引用前序结果: {$k1.answer} 或 {$k1.content}",
+    "- 每个 key 唯一, 用 2-4 个小写字母数字",
+    "- 输出合法 JSON, 不要 markdown 代码块",
+  ].join("\n")
+
+  const res = await client.stream({
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: `任务: ${task}` },
+    ],
+    tools: [],
+    model,
+    temperature: 0.1,
+  })
+  const raw = res.message.content
+  const parsed = tryParseSpec(raw)
+  if (!parsed) throw new Error(`[plan] LLM 返回的不是合法计划 JSON: ${raw?.slice(0, 300) ?? "(空)"}`)
+  return parsed
+}
+
+/** 容忍模型输出 ```json 包裹或前后杂音 */
+function tryParseSpec(raw: string): unknown {
+  if (!raw) return null
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim()
+  try {
+    const obj = JSON.parse(cleaned)
+    if (obj && typeof obj === "object" && (obj.type === "flow" || obj.type === "task" || obj.tool || obj.children)) {
+      return obj
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** 把计划 spec 渲染成可读树文本(UI 预览/回喂模型用) */
+export function renderSpec(spec: unknown): string {
+  const walk = (s: any, depth: number): string[] => {
+    if (!s) return []
+    if (Array.isArray(s)) return s.flatMap((x) => walk(x, depth))
+    if (typeof s !== "object") return []
+    const indent = "  ".repeat(depth)
+    const line = `${indent}${s.key ?? "?"} [${s.tool ?? s.type ?? "?"}]${s.params ? " " + JSON.stringify(s.params).slice(0, 80) : ""}`
+    return [line, ...walk(s.children ?? [], depth + 1)]
+  }
+  return walk(spec, 0).join("\n")
+}

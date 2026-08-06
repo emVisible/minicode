@@ -226,6 +226,60 @@ async function main(): Promise<void> {
     rmSync(dir, { recursive: true, force: true })
   }
 
+  // 场景 0: /plan 全并行 — 假 LLM 返回 DAG, 3 独立节点同波并行, 依赖链正确
+  {
+    const { mkdtempSync, rmSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "smoke-plan-"))
+    const spec = {
+      type: "flow",
+      key: "root",
+      children: [
+        { type: "task", key: "s1", tool: "shell", params: { cmd: "sleep 0.3" } },
+        { type: "task", key: "s2", tool: "shell", params: { cmd: "sleep 0.3" } },
+        { type: "task", key: "s3", tool: "shell", params: { cmd: "sleep 0.3" } },
+        {
+          type: "task",
+          key: "w",
+          tool: "write-file",
+          params: { path: join(dir, "o.txt"), content: "x={$s1.stdout}" },
+          dependsOn: ["s1"],
+        },
+        { type: "task", key: "r", tool: "read-file", params: { path: join(dir, "o.txt") }, dependsOn: ["w"] },
+      ],
+    }
+    const planSrv = createServer((req, res) => {
+      let raw = ""
+      req.on("data", (c) => (raw += c))
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: JSON.stringify(spec) } }] }))
+      })
+    })
+    await new Promise<void>((r) => planSrv.listen(0, r))
+    const planPort = (planSrv.address() as any).port
+    const { runPlannedTask } = await import("../src/influx/plan-runner.ts")
+    const nodeWaves = new Map<string, number>()
+    let curWave = 0
+    const t0 = performance.now()
+    const pr = await runPlannedTask("smoke", {
+      url: `http://127.0.0.1:${planPort}/v1/chat/completions`,
+      onEvent: (e) => {
+        if (e.type === "wave-start") curWave = e.n
+        if (e.type === "node-start" && e.key !== "root") nodeWaves.set(e.key, curWave)
+      },
+    })
+    const elapsed = performance.now() - t0
+    planSrv.close()
+    rmSync(dir, { recursive: true, force: true })
+    const s1 = nodeWaves.get("s1")!
+    check("plan: 3 独立节点同波并行", s1 === nodeWaves.get("s2") && s1 === nodeWaves.get("s3"))
+    check("plan: 依赖链 w>s1 且 r>w", nodeWaves.get("w")! > s1 && nodeWaves.get("r")! > nodeWaves.get("w")!)
+    check(`plan: 0.3s×3 并行+依赖 <1.6s (${(elapsed / 1000).toFixed(2)}s)`, elapsed < 1600)
+    check("plan: 依赖值传递", pr.ok && String(pr.results.r?.content ?? "").includes("x="))
+  }
+
   // 场景 1: write 被调用 → 工具结果回喂 → 模型给出最终文本
   {
     const s = await runScenario(scenario1, "请创建文件 /tmp/minicode-smoke-1.txt 内容为 hello mini")
