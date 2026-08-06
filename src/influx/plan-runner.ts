@@ -97,6 +97,7 @@ export async function generatePlanSpec(
   client: ReturnType<typeof createLLMClient>,
   task: string,
   model?: string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const system = [
     "你是计划生成器。把用户任务拆解为 Influx 计划(JSON spec), 只输出 JSON, 不要任何解释。",
@@ -121,6 +122,7 @@ export async function generatePlanSpec(
     tools: [],
     model,
     temperature: 0.1,
+    signal,
   })
   const raw = res.message.content
   const parsed = tryParseSpec(raw)

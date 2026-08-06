@@ -78,12 +78,15 @@ export function TaskTree({ run }: { run: TreeRun }): ReactNode {
         root.children.map((wave) => {
           const parallel = wave.children.length > 1
           const doneCount = wave.children.filter((c) => c.status === "done" || c.status === "error").length
-          const header =
-            wave.status === "running"
-              ? `${parallel ? "⚡" : "→"} 波次 ${wave.id.replace("wave_", "")}${parallel ? ` · ${wave.children.length} 并行` : ""}`
+          const isWave = wave.id.startsWith("wave_")
+          const waveNum = wave.id.replace("wave_", "")
+          const header = isWave
+            ? wave.status === "running"
+              ? `${parallel ? "⚡" : "→"} 波次 ${waveNum}${parallel ? ` · ${wave.children.length} 并行` : ""}`
               : wave.status === "done"
-                ? `✓ 波次 ${wave.id.replace("wave_", "")} (${doneCount}/${wave.children.length})`
-                : `○ 波次 ${wave.id.replace("wave_", "")}`
+                ? `✓ 波次 ${waveNum} (${doneCount}/${wave.children.length})`
+                : `○ 波次 ${waveNum}`
+            : `${STATUS_SYMBOL[wave.status].char} ${wave.label}`
           const headerColor = wave.status === "done" ? "green" : wave.status === "running" ? "cyan" : "gray"
           return (
             <Box key={wave.id} flexDirection="column" width="100%">

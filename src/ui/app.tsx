@@ -314,6 +314,13 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     spinnerTimerRef.current = setInterval(() => setSpinner((s) => (s + 1) % 4), 120)
     const root: TaskNode = { id: `run_${Date.now()}`, label: prompt, status: "done", children: [] }
     treeRef.current = root
+    // 拆解阶段树占位: 让侧边栏立即有内容("正在拆解"), 而非空白
+    root.children.push({
+      id: "decompose",
+      label: "正在拆解任务为并行 DAG…",
+      status: "running",
+      children: [],
+    })
     setTree({ ...root })
     setTreePrompt(prompt)
     appendLine({ kind: "user", text: prompt })
@@ -324,18 +331,35 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
 
     try {
       // ① 尝试拆解 DAG(1 次 LLM 调用, 低温度, 快速失败)
-      const { generatePlanSpec, countTaskNodes, runSpec } = await import("../influx/plan-runner.ts")
+      const { generatePlanSpec, countTaskNodes, runSpec, renderSpec } = await import("../influx/plan-runner.ts")
+      appendLine({ kind: "tool-start", text: "正在拆解任务为并行 DAG…(LLM 分析中)" })
       let spec: unknown
       try {
-        spec = await generatePlanSpec(client, prompt)
+        // 拆解限时 25s: 超时就回退普通对话, 不干等(用户可感知延迟上限)
+        const decomposeCtrl = new AbortController()
+        const timer = setTimeout(() => decomposeCtrl.abort(), 25_000)
+        try {
+          spec = await generatePlanSpec(client, prompt, undefined, decomposeCtrl.signal)
+        } finally {
+          clearTimeout(timer)
+        }
       } catch {
         spec = undefined
       }
       const nodes = spec ? countTaskNodes(spec) : 0
 
+      // 拆解完成: 移除占位节点(后续 wave-start 会加入真实波次)
+      if (treeRef.current) {
+        treeRef.current.children = treeRef.current.children.filter((c) => c.id !== "decompose")
+        bumpTree()
+      }
+
       if (nodes >= 2) {
         // ② Influx 全并行: 波次事件桥接任务树, 写操作进 VFS(VBuild)
-        appendLine({ kind: "tool-start", text: `⚡ 拆解为 ${nodes} 个并行任务, Influx 全并行执行` })
+        appendLine({ kind: "tool-result", text: `⚡ 已拆解为 ${nodes} 个任务, 全并行执行` })
+        for (const l of renderSpec(spec).split("\n")) {
+          appendLine({ kind: "tool-result", text: `  ${l}` })
+        }
         let curWave = 0
         await runSpec(spec, {
           cwd,
@@ -462,6 +486,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
 
     const root: TaskNode = { id: `plan_${Date.now()}`, label: task, status: "done", children: [] }
     treeRef.current = root
+    // 拆解阶段树占位
+    root.children.push({ id: "decompose", label: "正在拆解任务为并行 DAG…", status: "running", children: [] })
     setTree({ ...root })
     setTreePrompt(`/plan ${task}`)
     // Runtime 事件无波次号, 用事件顺序推断: wave-start 开启新波次, node-start 属于当前波次
@@ -473,7 +499,14 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         ask: queueAsk,
         vfs,
         onPlan: (spec) => {
-          appendLine({ kind: "tool-result", text: `计划生成: ${renderSpec(spec).split("\n").length} 个节点` })
+          // 拆解完成: 移除占位节点
+          if (treeRef.current) {
+            treeRef.current.children = treeRef.current.children.filter((c) => c.id !== "decompose")
+            bumpTree()
+          }
+          const lines = renderSpec(spec).split("\n")
+          appendLine({ kind: "tool-result", text: `计划生成: ${lines.length} 个节点` })
+          for (const l of lines) appendLine({ kind: "tool-result", text: `  ${l}` })
         },
         onEvent: (e) => {
           switch (e.type) {
