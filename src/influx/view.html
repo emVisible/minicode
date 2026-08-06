@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>influx · 编排可视化</title>
+<style>
+  :root {
+    --bg: #0d0f14;
+    --fg: #c8ccd4;
+    --dim: #5a6270;
+    --dimmer: #3a4150;
+    --green: #7ec699;
+    --amber: #e8c547;
+    --red: #e06c6c;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0 }
+  body { background: var(--bg); color: var(--fg); font: 12.5px/1.7 ui-monospace, "SF Mono", Menlo, Consolas, monospace; padding: 28px 20px; max-width: 760px; margin: 0 auto }
+  #prompt { color: var(--dim) }
+  #prompt .cmd { color: var(--fg) }
+  #status-line { margin-top: 4px; min-height: 1.7em }
+  .dot { color: var(--amber) }
+  .dot.done { color: var(--green) }
+  .dot.err { color: var(--red) }
+  .sec { color: var(--dim); margin: 18px 0 4px }
+  section { margin-bottom: 4px }
+  .dim { color: var(--dim) }
+  .line { white-space: pre }
+  .line .conn { color: var(--dimmer) }
+  .line .tool { color: var(--dim) }
+  .line.ok .ms { color: var(--green) }
+  .line.run { color: var(--amber) }
+  .line.err { color: var(--red) }
+  .line.cached { color: var(--dim) }
+  .line.cached .ms { color: var(--dim) }
+  .wave { white-space: pre }
+  .wave .bar { color: var(--green) }
+  .wave .bar.serial { color: var(--amber) }
+  .wave .nodes { color: var(--dim) }
+  .wave .err { color: var(--red) }
+  #stats .dim { color: var(--dim) }
+  #stats .g { color: var(--green) }
+  #stats .a { color: var(--amber) }
+  #stats .r { color: var(--red) }
+  #results .k { color: var(--dim) }
+  #log { max-height: 200px; overflow-y: auto; color: var(--dim) }
+  #log .iter { color: var(--amber) }
+  #cursor { display: inline-block; width: 7px; height: 13px; background: var(--dim); vertical-align: -2px; animation: blink 1s steps(1) infinite; margin-left: 4px }
+  @keyframes blink { 50% { opacity: 0 } }
+</style>
+</head>
+<body>
+  <div id="prompt">$ influx run <span class="cmd" id="plan">…</span> <span class="cmd" id="mode"></span></div>
+  <div id="status-line"><span class="dot" id="dot">●</span> <span id="status">running<span id="cursor"></span></span></div>
+
+  <section>
+    <div class="sec"># task flow (fiber)</div>
+    <div id="flow"></div>
+  </section>
+
+  <section>
+    <div class="sec"># waves</div>
+    <div id="waves"></div>
+  </section>
+
+  <section>
+    <div class="sec"># reconcile</div>
+    <div id="stats"></div>
+  </section>
+
+  <section>
+    <div class="sec"># results</div>
+    <div id="results"></div>
+  </section>
+
+  <section>
+    <div class="sec"># events</div>
+    <div id="log"></div>
+  </section>
+
+<script>
+const $ = (id) => document.getElementById(id)
+const lineEls = new Map()   // key -> { line, ms, tool }
+const waves = []
+let maxMs = 0
+
+const es = new EventSource("/events")
+es.addEventListener("evt", (m) => { try { handle(JSON.parse(m.data)) } catch (e) { log("parse error: " + e) } })
+es.onerror = () => log("连接中断, 刷新页面重连")
+
+function log(text, cls) {
+  const line = document.createElement("div")
+  if (cls) line.className = cls
+  line.textContent = text
+  $("log").append(line)
+  while ($("log").childNodes.length > 200) $("log").removeChild($("log").firstChild)
+}
+
+function bar(pct, n = 24) {
+  const filled = Math.round(pct * n)
+  return "[" + "█".repeat(filled) + "░".repeat(n - filled) + "]"
+}
+
+function renderTree(n) {
+  $("flow").innerHTML = ""
+  lineEls.clear()
+  if (!n) return
+  const root = line(n.key + `<span class="tool">[${n.tool}]</span>`, n, true)
+  $("flow").append(root)
+  walkList(childrenOf(n), "", 0)
+}
+
+function childrenOf(n) {
+  const out = []
+  for (let c = n.child; c; c = c.sibling) out.push(c)
+  return out
+}
+
+function walkList(list, prefix, depth) {
+  list.forEach((node, i) => walk(node, prefix, i === list.length - 1, depth))
+}
+
+function walk(n, prefix, last, depth) {
+  const lineEl = line(prefix + (last ? "└─ " : "├─ ") + n.key + `<span class="tool">[${n.tool}]</span>`, n)
+  $("flow").append(lineEl)
+  walkList(childrenOf(n), prefix + (last ? "    " : "│   "), depth + 1)
+}
+
+function line(label, n) {
+  const el = document.createElement("div")
+  el.className = "line " + (n.status === "skip" ? "cached" : "")
+  el.innerHTML = label
+  const ms = document.createElement("span")
+  ms.className = "ms"
+  updateSuffix(ms, n)
+  el.append(ms)
+  lineEls.set(n.key, { el, ms, tool: n.tool })
+  return el
+}
+
+function updateSuffix(ms, n) {
+  if (n.error) { ms.textContent = " · ERROR" }
+  else if (n.status === "skip") { ms.textContent = " · cached" }
+  else if (n.ms > 0.5) { ms.textContent = " · " + n.ms.toFixed(1) + "ms" }
+  else { ms.textContent = "" }
+}
+
+function renderWaves() {
+  $("waves").innerHTML = ""
+  for (const w of waves) {
+    const head = document.createElement("div")
+    head.className = "wave"
+    head.innerHTML = `wave ${w.n}  <span class="bar ${w.parallel ? "" : "serial"}">${bar(w.ms / maxMs)}</span> ${w.ms.toFixed(0)}ms`
+    $("waves").append(head)
+    const nodes = document.createElement("div")
+    nodes.className = "wave nodes"
+    nodes.textContent = "  " + w.nodes.map((x) => `${x.key} ${x.ms.toFixed(0)}ms${x.error ? " ✗" : ""}`).join(" · ")
+    $("waves").append(nodes)
+  }
+}
+
+function renderStats(stats) {
+  $("stats").innerHTML = ""
+  const parts = [
+    ['<span class="g">placement</span> ' + stats.placed],
+    ['<span class="a">update</span> ' + stats.updated],
+    ['<span class="dim">cached</span> ' + stats.skipped],
+    ['<span class="r">error</span> ' + stats.errors],
+  ]
+  const el = document.createElement("div")
+  el.innerHTML = parts.join(" · ")
+  $("stats").append(el)
+}
+
+function renderResults(results) {
+  $("results").innerHTML = ""
+  for (const [k, v] of Object.entries(results)) {
+    if (v === undefined) continue
+    const s = JSON.stringify(v)
+    const el = document.createElement("div")
+    el.innerHTML = `<span class="k">${k}</span> = ${s.length > 220 ? s.slice(0, 220) + "…" : s}`
+    $("results").append(el)
+  }
+}
+
+function handle(e) {
+  switch (e.type) {
+    case "run":
+      $("plan").textContent = e.plan
+      $("mode").textContent = e.serial ? "--serial" : "--parallel"
+      log(`$ influx run ${e.plan} ${e.serial ? "--serial" : "--parallel"}`)
+      break
+    case "iter":
+      log(`iter ${e.n}`, "iter")
+      break
+    case "reconcile":
+      log(`reconcile · placement ${e.stats.placed} · update ${e.stats.updated} · cached ${e.stats.skipped}`)
+      if (e.tree) renderTree(e.tree)
+      break
+    case "wave-start":
+      waves.push({ n: e.n, parallel: e.parallel, ms: 0, nodes: [] })
+      log(`wave ${e.n} start (${e.parallel ? "parallel" : "serial"})`)
+      break
+    case "node-start": {
+      const rec = lineEls.get(e.key)
+      if (rec) { rec.el.classList.add("run"); rec.ms.textContent = " · running" }
+      break
+    }
+    case "node-end": {
+      const rec = lineEls.get(e.key)
+      if (rec) {
+        rec.el.classList.remove("run")
+        if (e.error) rec.el.classList.add("err")
+        rec.ms.textContent = e.error ? " · ERROR" : " · " + e.ms.toFixed(1) + "ms"
+      }
+      const w = waves[waves.length - 1]
+      if (w) w.nodes.push({ key: e.key, ms: e.ms, error: e.error })
+      break
+    }
+    case "wave-end":
+      const w = waves.find((x) => x.n === e.n)
+      if (w) w.ms = e.ms
+      maxMs = Math.max(maxMs, e.ms)
+      renderWaves()
+      log(`wave ${e.n} done · ${e.ms.toFixed(0)}ms`)
+      break
+    case "done":
+      $("dot").classList.add("done")
+      $("status").textContent = `done · total ${(e.wall / 1000).toFixed(2)}s`
+      renderStats(e.stats)
+      if (e.tree) renderTree(e.tree)
+      renderResults(e.results)
+      log(`done · total ${(e.wall / 1000).toFixed(2)}s`)
+      break
+    case "error":
+      $("dot").classList.add("err")
+      $("status").textContent = "failed"
+      log("error: " + e.message)
+      break
+  }
+}
+</script>
+</body>
+</html>

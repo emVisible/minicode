@@ -1,0 +1,46 @@
+{
+  "name": "minicode",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Mini opencode: SSE 流式 LLM + tool-call 回环的对话式编码 agent, 内嵌 Influx 声明式计划运行时 (plan run/bench/view + MCP 编排)",
+  "bin": {
+    "minicode": "src/cli.ts"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "headless": "tsx src/cli.ts --headless",
+    "plan:run": "tsx src/cli.ts plan run",
+    "plan:bench": "tsx src/cli.ts plan bench",
+    "plan:view": "tsx src/cli.ts plan view",
+    "demo": "tsx src/cli.ts plan run examples/demo.plan.tsx",
+    "demo:rerun": "tsx src/cli.ts plan run examples/demo.plan.tsx --rerun",
+    "demo:serial": "tsx src/cli.ts plan run examples/demo.plan.tsx --serial",
+    "demo:shell": "tsx src/cli.ts plan run examples/shell.plan.tsx",
+    "demo:fs": "tsx src/cli.ts plan run examples/fs-demo.plan.tsx",
+    "demo:llm": "tsx src/cli.ts plan run examples/llm-demo.plan.tsx",
+    "bench": "tsx src/cli.ts plan bench examples/demo.plan.tsx",
+    "webui": "tsx src/cli.ts plan view examples/demo.plan.tsx",
+    "webui:shell": "tsx src/cli.ts plan view examples/shell.plan.tsx",
+    "mcp": "tsx src/influx/mcp.ts",
+    "smoke": "tsx test/smoke.ts",
+    "smoke:influx": "tsx test/influx-smoke.ts",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.plans.json --noEmit"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1",
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.8",
+    "undici": "^8",
+    "zod": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "@types/react": "^19.2.18",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
