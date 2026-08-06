@@ -19,6 +19,8 @@ export interface PlanRunResult {
   errors: Record<string, string>
   blocked: Record<string, string>
   message: string
+  /** 总耗时 ms */
+  wallMs: number
 }
 
 /**
@@ -59,12 +61,14 @@ export async function runSpec(spec: unknown, opts: RunSpecOpts = {}): Promise<Pl
   await ensureAgentTools()
   const rt = new Runtime(getTool)
   const plan = planFromSpec(spec)
+  const t0 = performance.now()
   const rep = await rt.run(plan, {
     cwd: opts.cwd ?? process.cwd(),
     ask: opts.ask ?? (async () => true),
     onEvent: opts.onEvent,
     ...(opts.vfs ? { vfs: opts.vfs } : {}),
   })
+  const wallMs = performance.now() - t0
   const failed = Object.keys(rt.errors).length + Object.keys(rt.blocked).length
   const staged = opts.vfs?.hasChanges() ? opts.vfs.summary() : undefined
   return {
@@ -75,6 +79,7 @@ export async function runSpec(spec: unknown, opts: RunSpecOpts = {}): Promise<Pl
     errors: rt.errors,
     blocked: rt.blocked,
     message: `计划执行完成: ${rep.waves.length} 波, placement ${rep.stats.placed}, cached ${rep.stats.skipped}, 失败 ${failed}${staged ? `, VBuild 暂存 ${staged.create} 创建/${staged.modify} 修改/${staged.del} 删除` : ""}`,
+    wallMs,
   }
 }
 
@@ -117,7 +122,7 @@ export async function generatePlanSpec(
     "  shell(params:{cmd}) 执行命令(bash/git/build/test)",
     "  http.get(params:{url}) / http.post(params:{url,body}) 远端 API",
     "  llm(params:{prompt}) 仅限生成文本/总结, 不作为主要执行手段",
-    "- write-file 的 content 可引用前序结果: {$k1.answer} 或 {$k1.content}",
+    "- write-file 的 content 可引用前序结果: {$k1.output}(所有工具统一返回 output 字段, 如 {$rd1.output} 或 {$sum.output})",
     "- 每个 key 唯一, 用 2-4 个小写字母数字",
     "- 若任务不适合拆解(纯问答/闲聊), 输出 { type:'task', key:'a1', tool:'llm', params:{prompt:'<原样转发>'}, children:[] }",
     "- 输出合法 JSON, 不要 markdown 代码块",

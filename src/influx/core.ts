@@ -97,6 +97,8 @@ export interface WaveNode {
   ms: number
   status: string
   error?: string
+  /** 节点结果的简短人类可读摘要(UI 展示用) */
+  summary?: string
 }
 
 export interface WaveInfo {
@@ -135,7 +137,7 @@ export type RuntimeEvent =
   | { type: "reconcile"; stats: RunStats }
   | { type: "wave-start"; n: number; parallel: boolean }
   | { type: "node-start"; key: string; tool: string; status: string }
-  | { type: "node-end"; key: string; tool: string; status: string; ms: number; error?: string }
+  | { type: "node-end"; key: string; tool: string; status: string; ms: number; error?: string; summary?: string }
   | { type: "wave-end"; n: number; ms: number }
   | { type: "stream"; key: string; text: string }
 
@@ -366,6 +368,7 @@ export class Runtime {
         f.ms = performance.now() - start
         f.executed = true
         f.done = true
+        const summary = summarizeResult(f.result, f.tool)
         onEvent?.({
           type: "node-end",
           key: f.key,
@@ -373,6 +376,7 @@ export class Runtime {
           status: f.status,
           ms: f.ms,
           error: f.error ? String(f.error) : undefined,
+          summary,
         })
         wave.nodes.push({
           key: f.key,
@@ -380,6 +384,7 @@ export class Runtime {
           ms: f.ms,
           status: f.status,
           error: f.error ? String(f.error) : undefined,
+          summary,
         })
       }
 
@@ -719,4 +724,27 @@ function toNum(v: unknown): number | undefined {
 
 function truthy(v: unknown): boolean {
   return !(v === undefined || v === false || v === "" || v === 0 || v === null)
+}
+
+/** 从工具结果提取简短人类可读摘要(供 UI 对话流展示) */
+function summarizeResult(result: unknown, tool: string): string | undefined {
+  if (result === undefined || result === null) return undefined
+  const r = result as Record<string, any>
+  if (typeof result === "string") return truncateSummary(result, 160)
+  // write-file: 优先显示路径(内容可能很长)
+  if (tool === "write-file" && typeof r.path === "string") {
+    return `${r.path}${typeof r.bytes === "number" ? ` (${r.bytes}B)` : ""}`
+  }
+  const out = r.output ?? r.answer ?? r.content
+  if (typeof out === "string" && out.trim()) return truncateSummary(out.trim(), 160)
+  // 结构化: shell -> stdout; read-file -> 路径
+  if (typeof r.stdout === "string" && r.stdout.trim()) return truncateSummary(r.stdout.trim(), 160)
+  if (typeof r.path === "string") return `${r.path}${typeof r.bytes === "number" ? ` (${r.bytes}B)` : ""}`
+  const text = JSON.stringify(r)
+  if (text && text !== "{}") return truncateSummary(text, 120)
+  return undefined
+}
+
+function truncateSummary(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + "…" : s
 }

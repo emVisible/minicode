@@ -319,7 +319,7 @@ async function main(): Promise<void> {
     const { join } = await import("node:path")
     const { tmpdir } = await import("node:os")
     const dir = mkdtempSync(join(tmpdir(), "smoke-dual-"))
-    writeFileSync(join(dir, "ui.tsx"), "old", "utf8")
+    writeFileSync(join(dir, "ui.tsx"), "old content", "utf8")
     writeFileSync(join(dir, "a.ts"), "const a = 1", "utf8")
     const { runSpec } = await import("../src/influx/plan-runner.ts")
     const { VFS } = await import("../src/vfs.ts")
@@ -331,7 +331,7 @@ async function main(): Promise<void> {
         { type: "task", key: "g1", tool: "agent.glob", params: { pattern: "**/*.tsx" } },
         { type: "task", key: "s1", tool: "agent.read", params: { path: join(dir, "a.ts") } },
         { type: "task", key: "r1", tool: "agent.read", params: { path: join(dir, "ui.tsx") }, dependsOn: ["g1"] },
-        { type: "task", key: "w1", tool: "write-file", params: { path: join(dir, "ui.tsx"), content: "{$r1.output}" }, dependsOn: ["r1"] },
+        { type: "task", key: "w1", tool: "write-file", params: { path: join(dir, "ui.tsx"), content: "v2:{$r1.output}" }, dependsOn: ["r1"] },
       ],
     }
     const rep = await runSpec(spec, {
@@ -348,9 +348,9 @@ async function main(): Promise<void> {
       waves.findIndex((w) => w.includes("r1")) > waves.findIndex((w) => w.includes("g1")) &&
         waves.findIndex((w) => w.includes("w1")) > waves.findIndex((w) => w.includes("r1")),
     )
-    check("dual: VBuild 暂存磁盘未动", readFileSync(join(dir, "ui.tsx"), "utf8") === "old" && vfs.hasChanges())
+    check("dual: VBuild 暂存磁盘未动", readFileSync(join(dir, "ui.tsx"), "utf8") === "old content" && vfs.hasChanges())
     await vfs.commit()
-    check("dual: RBuild 落盘", readFileSync(join(dir, "ui.tsx"), "utf8") !== "old")
+    check("dual: RBuild 落盘(引用+净化)", readFileSync(join(dir, "ui.tsx"), "utf8") === "v2:old content")
     rmSync(dir, { recursive: true, force: true })
   }
 

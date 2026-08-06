@@ -68,7 +68,7 @@ async function request(
     // 非 JSON 响应保持原文
   }
   if (res.statusCode >= 400) throw new Error(`[http] ${method} ${url} -> ${res.statusCode} ${truncate(text, 200)}`)
-  return { status: res.statusCode, headers: res.headers as Record<string, string>, body: parsed }
+  return { status: res.statusCode, headers: res.headers as Record<string, string>, body: parsed, output: typeof parsed === "string" ? parsed : JSON.stringify(parsed) }
 }
 
 // ---------- 本地 shell ----------
@@ -80,9 +80,10 @@ registerTool(
   async ({ cmd, timeoutMs = 30000 }) => {
     if (!cmd) throw new Error("[shell] 缺少 cmd")
     const { stdout, stderr } = await exec(cmd, { timeout: timeoutMs })
-    return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode: 0 }
+    const out = stdout.trim()
+    return { stdout: out, stderr: stderr.trim(), exitCode: 0, output: out }
   },
-  "执行本地 shell 命令, 参数: cmd(必填), timeoutMs; 返回 {stdout, stderr, exitCode}",
+  "执行本地 shell 命令, 参数: cmd(必填), timeoutMs; 返回 {stdout, stderr, exitCode, output}",
 )
 
 // ---------- 本地文件系统 ----------
@@ -102,14 +103,14 @@ registerTool(
       } else {
         ctx.vfs.write(abs, content)
       }
-      return { ok: true, path, bytes: Buffer.byteLength(content), append, vbuild: true }
+      return { ok: true, path, bytes: Buffer.byteLength(content), append, vbuild: true, output: content }
     }
     mkdirSync(dirname(path), { recursive: true })
     if (append) appendFileSync(path, content, "utf8")
     else writeFileSync(path, content, "utf8")
-    return { ok: true, path, bytes: statSync(path).size, append }
+    return { ok: true, path, bytes: statSync(path).size, append, output: content }
   },
-  "写文件(自动建目录), 参数: path(必填), content, append; 返回 {ok, path, bytes}; VBuild 模式下写入内存 overlay",
+  "写文件(自动建目录), 参数: path(必填), content, append; 返回 {ok, path, bytes, output}; VBuild 模式下写入内存 overlay",
 )
 
 registerTool(
@@ -122,14 +123,15 @@ registerTool(
       const abs = ctx.vfs.abs(path)
       if (ctx.vfs.has(abs)) {
         const content = ctx.vfs.read(abs)
-        return { exists: true, path: abs, content, bytes: Buffer.byteLength(content), vbuild: true }
+        return { exists: true, path: abs, content, output: content, bytes: Buffer.byteLength(content), vbuild: true }
       }
-      return { exists: false, path: abs, vbuild: true }
+      return { exists: false, path: abs, output: "", vbuild: true }
     }
-    if (!existsSync(path)) return { exists: false, path }
-    return { exists: true, path, content: readFileSync(path, "utf8"), bytes: statSync(path).size }
+    if (!existsSync(path)) return { exists: false, path, output: "" }
+    const content = readFileSync(path, "utf8")
+    return { exists: true, path, content, output: content, bytes: statSync(path).size }
   },
-  "读文件, 参数: path(必填); 返回 {exists, path, content, bytes}; VBuild 模式下读 overlay",
+  "读文件, 参数: path(必填); 返回 {exists, path, content, output, bytes}; VBuild 模式下读 overlay",
 )
 
 registerTool(
@@ -209,9 +211,9 @@ registerTool(
       },
     })
     if (res.message.tool_calls?.length) throw new Error("[llm] 意外收到 tool_calls(未传 tools)")
-    return { answer: res.message.content }
+    return { answer: res.message.content, output: res.message.content }
   },
-  "LLM 节点(OpenAI 兼容 chat/completions, 与对话侧共用 LLMClient)。参数: prompt(必填), system, model, temperature, url, timeoutMs; 传 tools(数组, 内置 agent 工具名) 则进入 agent 模式, 节点内跑 tool-call 回环并返回 {answer, steps, finish}; 否则返回 {answer}",
+  "LLM 节点(OpenAI 兼容 chat/completions, 与对话侧共用 LLMClient)。参数: prompt(必填), system, model, temperature, url, timeoutMs; 传 tools(数组, 内置 agent 工具名) 则进入 agent 模式, 节点内跑 tool-call 回环并返回 {answer, steps, finish}; 否则返回 {answer, output}",
 )
 
 function truncate(s: string, n = 200): string {

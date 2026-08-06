@@ -371,7 +371,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
             nodeStreams.delete(key)
           }
         }
-        await runSpec(spec, {
+        const rep = await runSpec(spec, {
           cwd,
           ask: queueAsk,
           vfs,
@@ -414,6 +414,12 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
                 break
               }
               case "node-end": {
+                // 节点结果摘要输出到对话流(对标 opencode 的每步结果展示)
+                if (e.summary && e.error === undefined) {
+                  appendLine({ kind: "tool-result", text: `  ${e.tool} → ${e.summary}` })
+                } else if (e.error) {
+                  appendLine({ kind: "error", text: `  ${e.tool} ✗ ${e.error.slice(0, 200)}` })
+                }
                 flushNodeStream(e.key)
                 if (treeRef.current) {
                   const wave = treeRef.current.children.find((c) => c.id === `wave_${curWave}`)
@@ -441,6 +447,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
             }
           },
         })
+        // 波次/构建汇总
+        appendLine({ kind: "tool-result", text: `✓ 构建完成: 全并行执行 ${rep.waves} 波, 总耗时 ${(rep.wallMs / 1000).toFixed(1)}s` })
         if (vfs.hasChanges()) {
           for (const c of vfs.diff()) {
             appendLine({
@@ -577,6 +585,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
               break
             }
             case "node-end": {
+              if (e.summary && e.error === undefined) {
+                appendLine({ kind: "tool-result", text: `  ${e.tool} → ${e.summary}` })
+              } else if (e.error) {
+                appendLine({ kind: "error", text: `  ${e.tool} ✗ ${e.error.slice(0, 200)}` })
+              }
               if (treeRef.current) {
                 const wave = treeRef.current.children.find((c) => c.id === `wave_${currentWave}`)
                 const node = wave?.children.find((c) => c.id === e.key)
