@@ -26,6 +26,8 @@ Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式
   - **组合式布局**: 左对话流 + 右任务树侧边栏, 各组件独立负责、组合拼接
   - **任务树视图**: 对话执行渲染为树 —— 用户消息(根)→ 每轮波次(分支)→ 工具调用(同层兄弟=并行),状态符号 ○/◐/✓/✗ + 颜色区分,并行波次标注 `波次 N · M 并行`,执行过程"看得见"
   - **`/plan <任务>`**: 让 LLM 把任务拆解为 DAG 计划, 交给 Influx 运行时**全并行执行**(无依赖节点同波并行, 依赖链自动串行) —— 对话理解 + 计划执行的"1+1>2"
+  - **`/vbuild <任务>` 两段式构建(VBuild → RBuild)**: 所有 write/edit 先进内存 overlay(VBuild, 虚拟文件系统 `src/vfs.ts`), 全程零磁盘副作用; 完成后展示 diff(+ 新建 / ~ 修改 / − 删除), 输入 y 才 **RBuild 并行批量落盘**, 输入 n 丢弃(可回滚)。`/plan` 同样走两段式
+  - 流式渲染独立于对话流(不触碰 lines 数组), 状态栏实时显示吞吐 `Nc/s`; 流式响应 60s 无数据自动报错(服务器挂起检测)
   - **内置设置面板**: TUI 内 `Ctrl+o`(或 `/config`)呼出,配置 LLM URL / API Key / Model,Enter 保存即生效并持久化到 `~/.minicode/config.json`(0600 权限,原子写);环境变量优先于配置文件
 - **终结条件**: stop(完成) / aborted(用户中断) / max_steps / doom_loop
 
@@ -84,8 +86,9 @@ LLM_MODEL=默认 "gpt-4o-mini"
 src/
   types.ts           单一真相源类型(消息/工具/事件)
   config.ts          用户配置(~/.minicode/config.json, 原子写/防御加载/0600)
-  llm.ts             SSE 流式客户端(零网络库, 自解析)
+  llm.ts             SSE 流式客户端(零网络库, 自解析, idle 超时/tps 统计)
   loop.ts            Agent 主循环(与 UI 解耦, 事件回调)
+  vfs.ts             虚拟文件系统(VBuild/RBuild 两段式构建核心)
   tools.ts           对话工具注册(含 influx 桥接 http_get/http_post/llm)
   prompt.ts          系统提示词
   ui/app.tsx         Ink TUI(消费 loop 事件)

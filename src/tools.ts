@@ -36,6 +36,29 @@ const readTool: ToolDef = {
     const rawPath = String(args.path ?? "")
     if (!rawPath) throw new Error("[read] 缺少 path 参数")
     const filepath = resolve(ctx.cwd, rawPath)
+    // VBuild 模式: 优先读 overlay(构建中的世界), 无则回退磁盘
+    if (ctx.vfs) {
+      if (ctx.vfs.has(filepath)) {
+        try {
+          const content = ctx.vfs.read(filepath)
+          const lines = content.split("\n")
+          const offset = Number(args.offset ?? 1)
+          const limit = Number(args.limit ?? MAX_READ_LINES)
+          const start = Math.max(0, offset - 1)
+          const slice = lines.slice(start, start + limit)
+          const body = slice.map((line, i) => `${start + i + 1}: ${line}`).join("\n")
+          return {
+            output: `<path>${filepath}</path>\n<type>vfs</type>\n<content>\n${body}\n</content>\n(虚拟层, 共 ${lines.length} 行, 显示 ${start + 1}-${start + slice.length})`,
+          }
+        } catch {
+          // overlay 标记删除 → 回退磁盘语义报"不存在"
+        }
+      } else {
+        return {
+          output: `<path>${filepath}</path>\n<type>vfs</type>\n<content>(虚拟构建中不存在)</content>\n(尚未创建)`,
+        }
+      }
+    }
     if (!existsSync(filepath)) {
       const parent = dirname(filepath)
       const guess = (readdirSync(parent, { withFileTypes: true }).filter((e) =>
@@ -93,6 +116,11 @@ const writeTool: ToolDef = {
       summary: `${filepath} (${Buffer.byteLength(content)} 字节)`,
     })
     if (!ok) throw new Error("[write] 用户拒绝了写文件")
+    // VBuild 模式: 写入内存 overlay, RBuild 阶段统一并行落盘
+    if (ctx.vfs) {
+      ctx.vfs.write(filepath, content)
+      return { output: `[vbuild] 已暂存 ${filepath} (${Buffer.byteLength(content)} 字节, 待 RBuild 落盘)` }
+    }
     mkdirSync(dirname(filepath), { recursive: true })
     writeFileSync(filepath, content, "utf8")
     return { output: `已写入 ${filepath} (${statSync(filepath).size} 字节)` }
@@ -308,6 +336,15 @@ const editTool: ToolDef = {
     const path = resolve(ctx.cwd, rawPath)
     const ok = await ctx.ask({ tool: "edit", summary: `${path}` })
     if (!ok) throw new Error("[edit] 用户拒绝了修改")
+    // VBuild 模式: 在 overlay 上做编辑(读 overlay → 替换 → 写回 overlay)
+    if (ctx.vfs) {
+      const original = ctx.vfs.read(path)
+      if (!original.includes(oldString)) throw new Error(`[edit] 在 ${path} 中未找到: ${oldString.slice(0, 80)}`)
+      const count = Math.max(1, Number(args.count ?? 1))
+      const replaced = count === 1 ? original.replace(oldString, String(args.newString ?? "")) : original.split(oldString).join(String(args.newString ?? ""))
+      ctx.vfs.write(path, replaced)
+      return { output: `[vbuild] 已暂存 ${path} 的替换 (待 RBuild 落盘)` }
+    }
     const original = readFileSync(path, "utf8")
     if (!original.includes(oldString)) throw new Error(`[edit] 在 ${path} 中未找到: ${oldString.slice(0, 80)}`)
     const count = Math.max(1, Number(args.count ?? 1))

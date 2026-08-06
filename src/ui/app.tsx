@@ -48,6 +48,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const streamBufRef = useRef("")
   const streamTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const STREAM_FLUSH_MS = 30
+  /** 流式文本独立渲染: 不写入 lines 数组, 只更新短 state, 避免长会话全量 diff */
+  const [streamText, setStreamText] = useState("")
+  /** 流式速率诊断: 每秒收到字符数(区分网络慢 vs 渲染慢) */
+  const [cps, setCps] = useState(0)
+  const cpsRef = useRef({ chars: 0, last: performance.now() })
   /** 并行工具计数: 显示当前同时在跑的工具数, 让并发可视化 */
   const runningToolsRef = useRef(0)
   const [runningTools, setRunningTools] = useState(0)
@@ -55,6 +60,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const treeRef = useRef<TaskNode | null>(null)
   const [tree, setTree] = useState<TaskNode | null>(null)
   const [treePrompt, setTreePrompt] = useState("")
+  /** VBuild 待确认的 RBuild 落盘 */
+  const pendingVfsRef = useRef<import("../vfs.ts").VFS | null>(null)
 
   /** 同步更新 lines state + ref。注意: updater 必须保持纯函数(React 可能多次调用),
    *  ref 的同步放到 useEffect 里做, 避免在 updater 内产生副作用 */
@@ -70,7 +77,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     setLines((prev) => [...prev, line])
   }
 
-  /** 把节流缓冲的流式文本一次性提交到状态并渲染 */
+  /** 流式文本实时渲染: 只更新短 state(streamText), 不触碰 lines 数组 */
   function flushStream(): void {
     if (streamTimerRef.current) {
       clearTimeout(streamTimerRef.current)
@@ -79,15 +86,22 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     const text = streamBufRef.current
     if (!text) return
     streamBufRef.current = ""
-    setLines((prev) => {
-      const last = prev.at(-1)
-      if (last && last.kind === "assistant" && last.stream) {
-        const next = [...prev]
-        next[next.length - 1] = { ...last, text: last.text + text }
-        return next
-      }
-      return [...prev, { kind: "assistant", text, stream: true }]
-    })
+    setStreamText((prev) => prev + text)
+  }
+
+  /** 一轮完成/工具调用时, 把已累积的流式文本固化进对话流 */
+  function commitStream(): void {
+    if (streamTimerRef.current) {
+      clearTimeout(streamTimerRef.current)
+      streamTimerRef.current = null
+    }
+    const text = streamBufRef.current
+    streamBufRef.current = ""
+    const existing = streamText
+    if (existing) setStreamText("")
+    const full = existing + text
+    if (!full) return
+    setLines((prev) => [...prev, { kind: "assistant", text: full }])
   }
 
   /** 权限确认队列: 并行工具调用可能同时触发多个 ask, 逐个展示 */
@@ -148,19 +162,28 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   function handleEvent(e: LoopEvent): void {
     switch (e.type) {
       case "step":
-        flushStream()
+        commitStream()
         setStep(e.n)
         return
       case "text": {
-        // 只累积到缓冲区, 由定时器批量提交, 防止高频 setState
+        // 只累积到缓冲区, 由定时器批量提交到 streamText(不触碰 lines)
         streamBufRef.current += e.text
+        // 速率统计: 1s 窗口内的字符数
+        const now = performance.now()
+        const c = cpsRef.current
+        c.chars += e.text.length
+        if (now - c.last >= 1000) {
+          setCps(Math.round(c.chars / ((now - c.last) / 1000)))
+          c.chars = 0
+          c.last = now
+        }
         if (!streamTimerRef.current) {
           streamTimerRef.current = setTimeout(flushStream, STREAM_FLUSH_MS)
         }
         return
       }
       case "wave-start": {
-        flushStream()
+        commitStream()
         if (treeRef.current) {
           upsertWave(treeRef.current, e)
           bumpTree()
@@ -168,7 +191,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         return
       }
       case "tool-start": {
-        flushStream()
+        commitStream()
         runningToolsRef.current++
         setRunningTools(runningToolsRef.current)
         if (treeRef.current) {
@@ -178,7 +201,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         return
       }
       case "tool-result": {
-        flushStream()
+        commitStream()
         runningToolsRef.current = Math.max(0, runningToolsRef.current - 1)
         setRunningTools(runningToolsRef.current)
         if (treeRef.current) {
@@ -194,7 +217,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         return
       }
       case "wave-end": {
-        flushStream()
+        commitStream()
         if (treeRef.current) {
           markWave(treeRef.current, e.n, "done")
           bumpTree()
@@ -202,7 +225,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         return
       }
       case "done":
-        flushStream()
+        commitStream()
         return
     }
   }
@@ -243,7 +266,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     } catch (e) {
       appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
     }
-    flushStream()
+    commitStream()
+    const c = cpsRef.current
+    c.chars = 0
+    c.last = performance.now()
+    setCps(0)
     // 清空未决的权限确认(中断/异常时不能让 Promise 悬空)
     for (const pending of askQueueRef.current) pending.resolve(false)
     askQueueRef.current = []
@@ -271,6 +298,9 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     const controller = new AbortController()
     controllerRef.current = controller
     const { runPlannedTask, renderSpec } = await import("../influx/plan-runner.ts")
+    const { VFS } = await import("../vfs.ts")
+    // /plan 也走两段式: 写操作先进 overlay(VBuild), 确认后 RBuild 落盘
+    const vfs = new VFS(cwd)
 
     const root: TaskNode = { id: `plan_${Date.now()}`, label: task, status: "done", children: [] }
     treeRef.current = root
@@ -283,6 +313,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
       const result = await runPlannedTask(task, {
         cwd,
         ask: queueAsk,
+        vfs,
         onPlan: (spec) => {
           appendLine({ kind: "tool-result", text: `计划生成: ${renderSpec(spec).split("\n").length} 个节点` })
         },
@@ -335,17 +366,118 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         },
       })
       appendLine({ kind: result.ok ? "tool-result" : "error", text: result.message })
+      if (vfs.hasChanges()) {
+        const s = vfs.summary()
+        for (const c of vfs.diff()) {
+          appendLine({
+            kind: "tool-result",
+            text: `  ${c.kind === "create" ? "+" : c.kind === "delete" ? "−" : "~"} ${c.path} (${c.bytes}B)`,
+          })
+        }
+        pendingVfsRef.current = vfs
+        appendLine({
+          kind: "assistant",
+          text: `RBuild 确认: 输入 y 落盘(${s.create + s.modify + s.del} 个文件并行写入), 输入 n 丢弃`,
+        })
+      }
     } catch (e) {
       appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
     }
     controllerRef.current = null
     setBusy(false)
     setStep(0)
-    flushStream()
+    commitStream()
+  }
+
+  /**
+   * /vbuild: 两段式构建。
+   * VBuild —— 普通 agent 循环, 但 write/edit 只进 VFS overlay(内存, 可并行/可回滚),
+   *           read 读到"构建中的世界"。全程零磁盘副作用。
+   * 预览 diff → 用户确认 → RBuild 并行批量落盘。
+   */
+  async function runVBuild(task: string): Promise<void> {
+    setBusy(true)
+    setInput("")
+    appendLine({ kind: "user", text: `/vbuild ${task}` })
+    appendLine({ kind: "tool-start", text: "VBuild: 虚拟构建中…(写操作只进内存 overlay, 不落盘)" })
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const { VFS } = await import("../vfs.ts")
+
+    const vfs = new VFS(cwd)
+    const root: TaskNode = { id: `vbuild_${Date.now()}`, label: task, status: "done", children: [] }
+    treeRef.current = root
+    setTree({ ...root })
+    setTreePrompt(`/vbuild ${task}`)
+
+    try {
+      const result = await runAgent({
+        history: historyRef.current,
+        userMessage: { role: "user", content: task },
+        tools,
+        system: buildSystemPrompt({ cwd, tools }),
+        cwd,
+        maxSteps: 30,
+        signal: controller.signal,
+        requests: (opts) => client.stream(opts),
+        ask: queueAsk,
+        onEvent: handleEvent,
+        vfs,
+      })
+      historyRef.current = result.messages
+      commitStream()
+      if (!vfs.hasChanges()) {
+        appendLine({ kind: "tool-result", text: "VBuild 完成: 无写操作(纯读/问答), 无需 RBuild" })
+      } else {
+        const s = vfs.summary()
+        appendLine({
+          kind: "tool-result",
+          text: `VBuild 完成: 创建 ${s.create} / 修改 ${s.modify} / 删除 ${s.del}, 共 ${s.bytes} 字节`,
+        })
+        for (const c of vfs.diff()) {
+          appendLine({
+            kind: "tool-result",
+            text: `  ${c.kind === "create" ? "+" : c.kind === "delete" ? "−" : "~"} ${c.path} (${c.bytes}B)`,
+          })
+        }
+        pendingVfsRef.current = vfs
+        appendLine({
+          kind: "assistant",
+          text: "RBuild 确认: 输入 y 落盘(并行写入), 输入 n 丢弃虚拟改动",
+        })
+      }
+    } catch (e) {
+      appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
+    }
+    controllerRef.current = null
+    setBusy(false)
+    setStep(0)
+    commitStream()
   }
 
   function submit(value: string): void {
     const trimmed = value.trim()
+    // VBuild 待确认: 输入 y/n 决定 RBuild 落盘或丢弃
+    if (pendingVfsRef.current) {
+      const vfs = pendingVfsRef.current
+      pendingVfsRef.current = null
+      if (trimmed.toLowerCase() === "y" || trimmed.toLowerCase() === "yes") {
+        void (async () => {
+          appendLine({ kind: "tool-start", text: "RBuild: 并行落盘…" })
+          try {
+            const changes = await vfs.commit()
+            appendLine({ kind: "tool-result", text: `RBuild 完成: ${changes.length} 个文件已写入磁盘` })
+          } catch (e) {
+            appendLine({ kind: "error", text: `RBuild 失败: ${e instanceof Error ? e.message : String(e)}` })
+          }
+        })()
+      } else {
+        vfs.rollback()
+        appendLine({ kind: "tool-result", text: "已丢弃虚拟改动(Rollback), 磁盘未动" })
+      }
+      setInput("")
+      return
+    }
     // 权限确认挂起时, 输入 y/n 放行或拒绝
     if (ask) {
       settleAsk(trimmed.toLowerCase() === "y" || trimmed.toLowerCase() === "yes")
@@ -377,6 +509,15 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         return
       }
       void runPlan(task)
+      return
+    }
+    if (trimmed.startsWith("/vbuild")) {
+      const task = trimmed.slice(7).trim()
+      if (!task) {
+        appendLine({ kind: "error", text: "用法: /vbuild <任务描述> — 虚拟构建(VBuild), 确认后真实落盘(RBuild)" })
+        return
+      }
+      void runVBuild(task)
       return
     }
     if (busy) {
@@ -432,6 +573,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
               {line.text}
             </Text>
           ))}
+          {streamText && (
+            <Text color="white" wrap="wrap">
+              {streamText}
+            </Text>
+          )}
         </Box>
         {tree && tree.children.length > 0 && (
           <Box marginLeft={2} width="50%" flexShrink={0}>
@@ -451,7 +597,9 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
             {busy
               ? runningTools > 1
                 ? `[${step}] ⚡并行×${runningTools}`
-                : `[${step}] ${"⠋⠙⠹⠸"[spinner] ?? " "}`
+                : streamText
+                  ? `[${step}] ${"⠋⠙⠹⠸"[spinner] ?? " "} ${cps}c/s`
+                  : `[${step}] ${"⠋⠙⠹⠸"[spinner] ?? " "}`
               : ">"}{" "}
           </Text>
           {/* ask 时输入框保持可用: 提交走 submit() 的 ask 分支 */}

@@ -38,6 +38,8 @@ export interface ToolRunContext {
   signal?: AbortSignal
   /** 写类工具在 ask 模式下执行前回调, 返回 true 才放行 */
   ask: (req: { tool: string; summary: string }) => Promise<boolean>
+  /** VBuild 虚拟文件系统: 存在时 write/edit 写入内存 overlay, 由 RBuild 统一落盘 */
+  vfs?: import("./vfs.ts").VFS
 }
 
 export interface ToolOutput {
@@ -74,6 +76,9 @@ export interface StreamResult {
   message: ChatMessage
   finish: StreamFinish
   usage: Usage
+  /** 流式诊断: 首 token 延迟 ms(网络+模型思考)与平均速率 tokens/s */
+  ttft?: number
+  tps?: number
 }
 
 // ---------- 任务树 ----------
@@ -108,6 +113,8 @@ export interface LoopOptions {
   ask: (req: { tool: string; summary: string }) => Promise<boolean>
   signal?: AbortSignal
   onEvent?: (e: LoopEvent) => void
+  /** VBuild 虚拟文件系统: 传入后 write/edit 进 overlay, RBuild 统一落盘 */
+  vfs?: import("./vfs.ts").VFS
 }
 
 export type LoopEvent =

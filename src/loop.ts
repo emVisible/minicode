@@ -119,6 +119,7 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
             cwd: input.cwd,
             signal,
             ask: input.ask,
+            ...(input.vfs ? { vfs: input.vfs } : {}),
           })
           const ms = performance.now() - t0
           onEvent?.({ type: "tool-result", id, tool, ms })

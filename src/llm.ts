@@ -112,26 +112,41 @@ export class LLMClient {
     }
 
     const state = newState()
+    const t0 = performance.now()
+    let firstTokenAt = 0
     const ctype = res.headers.get("content-type") ?? ""
     if (ctype.includes("application/json") && !ctype.includes("text/event-stream")) {
       // 兼容不支持 stream 的 provider 子集: 一次返回完整 JSON
       const json: any = await res.json()
       const msg = json.choices?.[0]?.message
+      const ttft = performance.now() - t0
+      const usage = toUsage(json)
       return {
         message: { role: "assistant", content: msg?.content ?? "", ...(msg?.tool_calls?.length ? { tool_calls: msg.tool_calls } : {}) },
         finish: (json.choices?.[0]?.finish_reason as StreamFinish) ?? "stop",
-        usage: toUsage(json),
+        usage,
+        ttft,
+        tps: usage.outputTokens > 0 && ttft > 0 ? (usage.outputTokens / ttft) * 1000 : undefined,
       }
     }
 
-    await this.readSSE(res, state, opts.onDelta)
+    const timedDelta = (e: { type: "text-delta"; text: string }) => {
+      if (!firstTokenAt) firstTokenAt = performance.now()
+      opts.onDelta?.(e)
+    }
+    await this.readSSE(res, state, timedDelta)
     const calls = [...state.calls.values()]
       .filter((c) => c.name)
       .map((c): ToolCall => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.arguments } }))
+    const total = performance.now() - t0
+    const ttft = firstTokenAt ? firstTokenAt - t0 : total
+    const outTokens = state.text.length / 4 // 粗略: 中文约 4 字符/token, 英文约 4 字符/token
     return {
       message: { role: "assistant", content: state.text, ...(calls.length ? { tool_calls: calls } : {}) },
       finish: state.finish,
       usage: state.usage,
+      ttft,
+      tps: outTokens > 0 && total - ttft > 0 ? (outTokens / (total - ttft)) * 1000 : undefined,
     }
   }
 
@@ -145,6 +160,19 @@ export class LLMClient {
     const decoder = new TextDecoder()
     let buffer = ""
 
+    // idle 超时: 流开始后 60s 无数据(服务器挂起/网络断开) → 报错而不是无限等
+    const IDLE_TIMEOUT_MS = 60_000
+    let idleTimer: ReturnType<typeof setTimeout> | null = null
+    let idleFired = false
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        idleFired = true
+        void reader.cancel().catch(() => {})
+      }, IDLE_TIMEOUT_MS)
+    }
+    armIdle()
+
     const flushLine = (line: string) => {
       const idx = line.indexOf(":")
       if (idx === -1) return
@@ -155,16 +183,27 @@ export class LLMClient {
       this.parseChunk(state, data, onDelta)
     }
 
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let nl = buffer.indexOf("\n")
-      while (nl !== -1) {
-        flushLine(buffer.slice(0, nl))
-        buffer = buffer.slice(nl + 1)
-        nl = buffer.indexOf("\n")
+    try {
+      while (true) {
+        let chunk: ReadableStreamReadResult<Uint8Array>
+        try {
+          chunk = await reader.read()
+        } catch {
+          if (idleFired) throw new LLMError("[llm] 流式响应 60s 无数据(服务器挂起?), 已中断", true)
+          throw new LLMError("[llm] 流式读取中断", true)
+        }
+        if (chunk.done) break
+        armIdle()
+        buffer += decoder.decode(chunk.value, { stream: true })
+        let nl = buffer.indexOf("\n")
+        while (nl !== -1) {
+          flushLine(buffer.slice(0, nl))
+          buffer = buffer.slice(nl + 1)
+          nl = buffer.indexOf("\n")
+        }
       }
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer)
     }
     if (buffer.length) flushLine(buffer)
   }

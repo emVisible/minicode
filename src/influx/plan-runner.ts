@@ -35,6 +35,7 @@ export async function runPlannedTask(
     onEvent?: (e: RuntimeEvent) => void
     ask?: (req: { tool: string; summary: string }) => Promise<boolean>
     cwd?: string
+    vfs?: import("../vfs.ts").VFS
   } = {},
 ): Promise<PlanRunResult> {
   const client = createLLMClient({ endpoint: opts.url ? resolveEndpoint(opts.url) : undefined })
@@ -47,8 +48,10 @@ export async function runPlannedTask(
     cwd: opts.cwd ?? process.cwd(),
     ask: opts.ask ?? (async () => true),
     onEvent: opts.onEvent,
+    ...(opts.vfs ? { vfs: opts.vfs } : {}),
   })
   const failed = Object.keys(rt.errors).length + Object.keys(rt.blocked).length
+  const staged = opts.vfs?.hasChanges() ? opts.vfs.summary() : undefined
   return {
     ok: failed === 0,
     waves: rep.waves.length,
@@ -56,7 +59,7 @@ export async function runPlannedTask(
     results: rt.results,
     errors: rt.errors,
     blocked: rt.blocked,
-    message: `计划执行完成: ${rep.waves.length} 波, placement ${rep.stats.placed}, cached ${rep.stats.skipped}, 失败 ${failed}`,
+    message: `计划执行完成: ${rep.waves.length} 波, placement ${rep.stats.placed}, cached ${rep.stats.skipped}, 失败 ${failed}${staged ? `, VBuild 暂存 ${staged.create} 创建/${staged.modify} 修改/${staged.del} 删除` : ""}`,
   }
 }
 

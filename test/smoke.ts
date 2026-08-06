@@ -277,7 +277,39 @@ async function main(): Promise<void> {
     check("plan: 3 独立节点同波并行", s1 === nodeWaves.get("s2") && s1 === nodeWaves.get("s3"))
     check("plan: 依赖链 w>s1 且 r>w", nodeWaves.get("w")! > s1 && nodeWaves.get("r")! > nodeWaves.get("w")!)
     check(`plan: 0.3s×3 并行+依赖 <1.6s (${(elapsed / 1000).toFixed(2)}s)`, elapsed < 1600)
-    check("plan: 依赖值传递", pr.ok && String(pr.results.r?.content ?? "").includes("x="))
+    check("plan: 依赖值传递", pr.ok && String((pr.results.r as any)?.content ?? "").includes("x="))
+  }
+
+  // 场景 0b: VFS 两段式构建 — VBuild 写 overlay 磁盘不动, diff 正确, RBuild commit 落盘
+  {
+    const { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "smoke-vfs-"))
+    const aPath = join(dir, "a.txt")
+    const bPath = join(dir, "b.txt")
+    writeFileSync(aPath, "hello", "utf8")
+    writeFileSync(bPath, "bye", "utf8")
+    const { VFS } = await import("../src/vfs.ts")
+    const vfs = new VFS(dir)
+    vfs.write(join(dir, "new.txt"), "new content")
+    vfs.write(aPath, "hello world")
+    vfs.remove(bPath)
+    check("VFS: VBuild 写 overlay 磁盘不动", readFileSync(aPath, "utf8") === "hello" && !existsSync(join(dir, "new.txt")))
+    const kinds = vfs.diff().map((c) => c.kind)
+    check("VFS: diff 分类 create/modify/delete", kinds.includes("create") && kinds.includes("modify") && kinds.includes("delete"))
+    await vfs.commit()
+    check(
+      "VFS: RBuild 落盘(新建/修改/删除)",
+      readFileSync(join(dir, "new.txt"), "utf8") === "new content" &&
+        readFileSync(aPath, "utf8") === "hello world" &&
+        !existsSync(bPath),
+    )
+    const vfs2 = new VFS(dir)
+    vfs2.write(join(dir, "roll.txt"), "x")
+    vfs2.rollback()
+    check("VFS: rollback 丢弃", !vfs2.hasChanges() && !existsSync(join(dir, "roll.txt")))
+    rmSync(dir, { recursive: true, force: true })
   }
 
   // 场景 1: write 被调用 → 工具结果回喂 → 模型给出最终文本

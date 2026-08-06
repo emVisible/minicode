@@ -63,6 +63,8 @@ export interface ToolCtx {
   cwd: string
   /** 写类/命令类工具的确认回调(计划侧默认放行, 由 CLI/MCP 注入) */
   ask: (req: { tool: string; summary: string }) => Promise<boolean>
+  /** VBuild 虚拟文件系统: 存在时 write-file/read-file 走内存 overlay, RBuild 统一落盘 */
+  vfs?: import("../vfs.ts").VFS
 }
 
 export type FiberStatus = "placement" | "update" | "skip" | "blocked"
@@ -140,6 +142,7 @@ export interface RuntimeOptions {
   onEvent?: (e: RuntimeEvent) => void
   cwd?: string
   ask?: (req: { tool: string; summary: string }) => Promise<boolean>
+  vfs?: import("../vfs.ts").VFS
 }
 
 // ---------- 调度器 ----------
@@ -167,13 +170,13 @@ export class Runtime {
   }
 
   async run(plan: unknown, opts: RuntimeOptions = {}): Promise<RunReport> {
-    const { serial = false, maxIter = 8, onEvent, cwd = process.cwd(), ask = async () => true } = opts
+    const { serial = false, maxIter = 8, onEvent, cwd = process.cwd(), ask = async () => true, vfs } = opts
     this.waves = []
     this.stats = { placed: 0, updated: 0, skipped: 0, blocked: 0, errors: 0 }
     this.lastCached = []
     this.errors = {}
     this.blocked = {}
-    const ctx: ToolCtx = { results: this.results, errors: this.errors, cwd, ask }
+    const ctx: ToolCtx = { results: this.results, errors: this.errors, cwd, ask, ...(vfs ? { vfs } : {}) }
     // 静态计划(非函数)一次 render 即可收敛; 函数计划随状态重渲染直到稳定
     const maxLoop = typeof plan === "function" ? maxIter : 1
 

@@ -89,27 +89,47 @@ registerTool(
 
 registerTool(
   "write-file",
-  async ({ path, content = "", append = false }) => {
+  async ({ path, content = "", append = false }, ctx) => {
     const { mkdirSync, writeFileSync, appendFileSync, statSync } = await import("node:fs")
     const { dirname } = await import("node:path")
     if (!path) throw new Error("[write-file] 缺少 path")
+    // VBuild 模式: 写入内存 overlay, RBuild 统一落盘
+    if (ctx.vfs) {
+      const abs = ctx.vfs.abs(path)
+      if (append) {
+        const prev = ctx.vfs.has(abs) ? ctx.vfs.read(abs) : ""
+        ctx.vfs.write(abs, prev + content)
+      } else {
+        ctx.vfs.write(abs, content)
+      }
+      return { ok: true, path, bytes: Buffer.byteLength(content), append, vbuild: true }
+    }
     mkdirSync(dirname(path), { recursive: true })
     if (append) appendFileSync(path, content, "utf8")
     else writeFileSync(path, content, "utf8")
     return { ok: true, path, bytes: statSync(path).size, append }
   },
-  "写文件(自动建目录), 参数: path(必填), content, append; 返回 {ok, path, bytes}",
+  "写文件(自动建目录), 参数: path(必填), content, append; 返回 {ok, path, bytes}; VBuild 模式下写入内存 overlay",
 )
 
 registerTool(
   "read-file",
-  async ({ path }) => {
+  async ({ path }, ctx) => {
     const { readFileSync, existsSync, statSync } = await import("node:fs")
     if (!path) throw new Error("[read-file] 缺少 path")
+    // VBuild 模式: 优先读 overlay(构建中的世界)
+    if (ctx.vfs) {
+      const abs = ctx.vfs.abs(path)
+      if (ctx.vfs.has(abs)) {
+        const content = ctx.vfs.read(abs)
+        return { exists: true, path: abs, content, bytes: Buffer.byteLength(content), vbuild: true }
+      }
+      return { exists: false, path: abs, vbuild: true }
+    }
     if (!existsSync(path)) return { exists: false, path }
     return { exists: true, path, content: readFileSync(path, "utf8"), bytes: statSync(path).size }
   },
-  "读文件, 参数: path(必填); 返回 {exists, path, content, bytes}",
+  "读文件, 参数: path(必填); 返回 {exists, path, content, bytes}; VBuild 模式下读 overlay",
 )
 
 registerTool(
