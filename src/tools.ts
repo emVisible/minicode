@@ -69,8 +69,21 @@ const readTool: ToolDef = {
       throw new Error(`文件不存在: ${filepath}${guess.length ? `\n相似条目: ${guess.join(", ")}` : ""}`)
     }
     if (statSync(filepath).isDirectory()) {
-      const entries = readdirSync(filepath)
-      return { output: `<path>${filepath}</path>\n<type>directory</type>\n<entries>\n${entries.slice(0, MAX_READ_LINES).join("\n")}\n</entries>\n(共 ${entries.length} 项)` }
+      // 带大小/类型的目录列表: 模型无需重复读目录就能判断下一步(减少重复 read 导致的死循环误判)
+      const entries = readdirSync(filepath, { withFileTypes: true })
+        .slice(0, MAX_READ_LINES)
+        .map((e) => {
+          const p = `${filepath}/${e.name}`
+          if (e.isDirectory()) return `${e.name}/ (dir)`
+          try {
+            return `${e.name} (${statSync(p).size}B)`
+          } catch {
+            return `${e.name} (?)`
+          }
+        })
+      return {
+        output: `<path>${filepath}</path>\n<type>directory</type>\n<entries>\n${entries.join("\n")}\n</entries>\n(共 ${readdirSync(filepath).length} 项, 显示前 ${entries.length} 项, 每项带大小)` ,
+      }
     }
     const size = statSync(filepath).size
     if (size > MAX_READ_BYTES) {

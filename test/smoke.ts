@@ -373,11 +373,82 @@ async function main(): Promise<void> {
     check("steps=2", result.steps === 2, `steps=${result.steps}`)
   }
 
-  // 场景 2: 死循环在 3 次同参数调用后被中止
+  // 场景 2: 死循环在警告后仍未改变时中止(连续 3 次警告, 第 4 次中止)
   {
     const s = await runScenario(scenario2, "read 循环")
     const result = await s.run()
     check("doom-loop 触发", result.finish === "doom_loop", JSON.stringify(result.finish))
+  }
+
+  // 场景 2b: 非连续重复(读 A → 写 B → 再读 A)不算死循环, 正常完成
+  {
+    const s = await runScenario(
+      {
+        name: "非连续重复",
+        toolCalls: (msgs) => {
+          const tools = msgs.filter((m) => m.role === "tool")
+          if (tools.length < 2) return [{ name: "read", args: JSON.stringify({ path: "/tmp/smoke-a.txt" }) }]
+          return [{ name: "write", args: JSON.stringify({ path: "/tmp/smoke-b.txt", content: "b" }) }]
+        },
+        finalText: (msgs) => {
+          const t = msgs.filter((m) => m.role === "tool")
+          return `完成, ${t.length} 条回执`
+        },
+      },
+      "修改文件",
+    )
+    const result = await s.run()
+    check("非连续重复不误杀(应 stop)", result.finish === "stop", JSON.stringify(result.finish))
+  }
+
+  // 场景 2c: 波次内并行重复参数不累积 —— RBuild 误报回归测试。
+  // 模型在并行波次里重复参数(如一步并行 read 同一文件两次)是常见行为,
+  // 旧实现按调用计数: [A,A]+[A,A] = 4 → 直接中止; 新实现按整批签名比较,
+  // 只有整批与上一批完全一致才 +1, 波次内重复不再累积。
+  {
+    const s = await runScenario(
+      {
+        name: "并行重复不误杀",
+        doom: true,
+        toolCalls: (msgs) => {
+          const tools = msgs.filter((m) => m.role === "tool")
+          if (tools.length < 4) {
+            // 波次 1/2: 并行重复 read(旧实现 2 步即 4 次 → 误杀)
+            return [
+              { name: "read", args: JSON.stringify({ path: "/tmp/smoke-c.txt" }) },
+              { name: "read", args: JSON.stringify({ path: "/tmp/smoke-c.txt" }) },
+            ]
+          }
+          if (tools.length < 6) {
+            // 波次 3: 换个调用(重置连续计数)
+            return [{ name: "read", args: JSON.stringify({ path: "/tmp/smoke-d.txt" }) }]
+          }
+          return undefined // 停止
+        },
+        finalText: () => "完成",
+      },
+      "并行重复",
+    )
+    const result = await s.run()
+    check("波次内并行重复不误杀(应 stop)", result.finish === "stop", JSON.stringify(result.finish))
+  }
+
+  // 场景 2d: 真并行循环仍被捕获 —— 整批签名连续一致 4 波次 → 中止
+  {
+    const s = await runScenario(
+      {
+        name: "并行真循环",
+        doom: true,
+        toolCalls: () => [
+          { name: "read", args: JSON.stringify({ path: "/tmp/smoke-e.txt" }) },
+          { name: "read", args: JSON.stringify({ path: "/tmp/smoke-e.txt" }) },
+        ],
+        finalText: () => "unreachable",
+      },
+      "并行循环",
+    )
+    const result = await s.run()
+    check("真并行循环仍中止(doom_loop)", result.finish === "doom_loop", JSON.stringify(result.finish))
   }
 
   // 场景 3: 坏参数 JSON → 参数解析失败消息回喂

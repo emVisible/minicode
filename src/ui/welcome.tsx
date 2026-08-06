@@ -1,51 +1,44 @@
-// 启动欢迎卡片 —— 信息面板 + 命令速查, 简约居中风格
+// 启动欢迎卡片 —— 极简 wordmark + 命令网格(Apple 式: 无边框, 排印表达层级)
 // 只渲染一次(首个会话消息前), 随对话滚动到上方
 
 import React from "react"
 import type { ReactNode } from "react"
 import { Box, Text } from "ink"
+import type { ThemeTokens } from "./theme.ts"
 
-export function WelcomeCard(props: { cwd: string; model: string; toolCount: number }): ReactNode {
-  const { cwd, model, toolCount } = props
+export function WelcomeCard(props: { cwd: string; model: string; toolCount: number; t: ThemeTokens }): ReactNode {
+  const { cwd, model, toolCount, t } = props
+  const rows: Array<[string, string]> = [
+    ["Tab", "Plan / Build 模式切换"],
+    ["/plan", "LLM 拆解为并行 DAG 并执行"],
+    ["/vbuild", "虚拟构建 → 确认后落盘"],
+    ["/config", "配置模型连接"],
+    ["/reset", "清空会话"],
+    ["/quit", "退出"],
+    ["Ctrl+o", "设置面板"],
+  ]
   return (
     <Box flexDirection="column" width="100%">
-      <Box
-        borderStyle="round"
-        borderColor="cyan"
-        flexDirection="column"
-        paddingX={2}
-        paddingY={1}
-        width="100%"
-      >
-        <Box flexDirection="row" alignItems="center">
-          <Text bold color="cyan">
-            MiniCode
-          </Text>
-          <Text color="gray"> · 双引擎编码 agent · v0.4</Text>
-        </Box>
-        <Box flexDirection="column" marginTop={1}>
-          <Box flexDirection="row">
-            <Text color="gray">目录 </Text>
-            <Text color="white">{cwd}</Text>
+      <Box flexDirection="column" paddingY={1}>
+        <Text color={t.accent} bold>
+          minicode
+        </Text>
+        <Text color={t.inkDim}>
+          {cwd} · {model} · {toolCount} 工具
+        </Text>
+      </Box>
+      <Box flexDirection="column">
+        {rows.map(([k, v], i) => (
+          <Box key={i} flexDirection="row">
+            <Box width={11}>
+              <Text color={t.inkDim}>{k}</Text>
+            </Box>
+            <Text color={t.inkFaint}>{v}</Text>
           </Box>
-          <Box flexDirection="row">
-            <Text color="gray">模型 </Text>
-            <Text color="white">{model}</Text>
-          </Box>
-          <Box flexDirection="row">
-            <Text color="gray">工具 </Text>
-            <Text color="white">{toolCount} 个</Text>
-            <Text color="gray"> · 计划运行时 · VBuild/RBuild · MCP</Text>
-          </Box>
-        </Box>
-        <Box flexDirection="column" marginTop={1}>
-          <Text color="gray">Ctrl+o 设置 · /config 配置</Text>
-          <Text color="gray">/plan 任务拆解全并行 · /vbuild 两段式构建</Text>
-          <Text color="gray">/reset 清空会话 · /quit 退出</Text>
-        </Box>
+        ))}
       </Box>
       <Box marginTop={1}>
-        <Text color="gray">输入指令, Enter 提交。复杂任务会自动拆解为并行 DAG 执行。</Text>
+        <Text color={t.inkDim}>输入指令开始。Tab 切换 Plan(先想)/Build(动手)两种模式。</Text>
       </Box>
     </Box>
   )

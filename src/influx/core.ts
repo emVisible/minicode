@@ -3,6 +3,7 @@
 //   → commit(就绪前沿并行执行工具, 统一提交结果) → 重规划(计划随状态重渲染, 直到稳定)
 
 import { createHash } from "node:crypto"
+import { resolve as resolvePath } from "node:path"
 
 export interface Element {
   type: unknown
@@ -56,6 +57,18 @@ export function planFromSpec(spec: any): unknown {
 
 export type ToolRun = (params: Record<string, any>, ctx: ToolCtx) => Promise<unknown>
 
+/**
+ * 预取缓存 —— 预测式执行: 计划 DAG 本身是"模型对自己后续行为的预测",
+ * 在上一波执行期间预读下一波 read-file 的输入, 把 IO 延迟隐藏在波次执行后面。
+ * warm() 是后台非阻塞的; get() 供 read-file 命中。
+ */
+export interface PrefetchCache {
+  get(path: string): string | undefined
+  warm(paths: string[]): void
+  /** 文件被真实写入后作废旧缓存(防止预取内容过期) */
+  invalidate(path: string): void
+}
+
 export interface ToolCtx {
   results: Record<string, unknown>
   errors: Record<string, string>
@@ -65,8 +78,14 @@ export interface ToolCtx {
   ask: (req: { tool: string; summary: string }) => Promise<boolean>
   /** VBuild 虚拟文件系统: 存在时 write-file/read-file 走内存 overlay, RBuild 统一落盘 */
   vfs?: import("../vfs.ts").VFS
-  /** llm 节点流式输出回调(thinking 过程可视化) */
+  /** llm 节点流式输出回调(thinking 过程可视化); key 为当前节点 key */
   onStream?: (key: string, text: string) => void
+  /** 当前执行节点的 key(用于 llm 节点区分多个节点的流式输出) */
+  key?: string
+  /** 用户中断信号(Esc); 工具执行时合并到自身超时 */
+  signal?: AbortSignal
+  /** 预取缓存(预测式执行): read-file 命中后跳过磁盘 IO; 运行时预热下一前沿 */
+  prefetch?: PrefetchCache
 }
 
 export type FiberStatus = "placement" | "update" | "skip" | "blocked"
@@ -148,6 +167,9 @@ export interface RuntimeOptions {
   cwd?: string
   ask?: (req: { tool: string; summary: string }) => Promise<boolean>
   vfs?: import("../vfs.ts").VFS
+  /** 预取缓存(预测式执行): 运行时在每波执行前预热下一就绪前沿的读输入 */
+  prefetch?: PrefetchCache
+  signal?: AbortSignal
 }
 
 // ---------- 调度器 ----------
@@ -175,7 +197,7 @@ export class Runtime {
   }
 
   async run(plan: unknown, opts: RuntimeOptions = {}): Promise<RunReport> {
-    const { serial = false, maxIter = 8, onEvent, cwd = process.cwd(), ask = async () => true, vfs } = opts
+    const { serial = false, maxIter = 8, onEvent, cwd = process.cwd(), ask = async () => true, vfs, signal, prefetch } = opts
     this.waves = []
     this.stats = { placed: 0, updated: 0, skipped: 0, blocked: 0, errors: 0 }
     this.lastCached = []
@@ -187,6 +209,8 @@ export class Runtime {
       cwd,
       ask,
       ...(vfs ? { vfs } : {}),
+      ...(signal ? { signal } : {}),
+      ...(prefetch ? { prefetch } : {}),
       ...(onEvent
         ? {
             onStream: (key: string, text: string) => onEvent({ type: "stream", key, text }),
@@ -197,6 +221,7 @@ export class Runtime {
     const maxLoop = typeof plan === "function" ? maxIter : 1
 
     for (let i = 0; i < maxLoop; i++) {
+      if (signal?.aborted) throw new Error("[influx] 计划执行已中断(用户取消)")
       onEvent?.({ type: "iter", n: i + 1 })
       const element = typeof plan === "function" ? (plan as any)(this.store) : plan
       this.lastTree = buildElement(element, null, ctx)
@@ -294,6 +319,28 @@ export class Runtime {
     return f.deps.every((d) => d in this.results)
   }
 
+  /**
+   * 预测式预取: 收集「当前波提交后就会就绪」的下一批 read-file/list-dir 输入路径。
+   * 计划 DAG = 模型对自己后续行为的预测 —— 提前读, 把 IO 延迟隐藏在前一波执行背后。
+   * 含 $ 引用(依赖先前结果)的路径无法现在就解析, 跳过; 写类节点不预取。
+   */
+  private nextFrontierReads(fibers: Fiber[], waveKeys: Set<string>, cwd: string): string[] {
+    const out: string[] = []
+    for (const f of fibers) {
+      if (f.done || !f.isHost) continue
+      if (f.tool !== "read-file" && f.tool !== "list-dir") continue
+      const parentOk = !f.parent || f.parent.done || waveKeys.has(f.parent.key)
+      if (!parentOk) continue
+      const depsOk = f.deps.every((d) => d in this.results || waveKeys.has(d))
+      if (!depsOk) continue
+      const p = f.params?.path
+      if (typeof p === "string" && !p.includes("$")) {
+        out.push(resolvePath(cwd, p))
+      }
+    }
+    return out
+  }
+
   private async runWaves(
     fibers: Fiber[],
     serial: boolean,
@@ -301,8 +348,11 @@ export class Runtime {
     onEvent?: (e: RuntimeEvent) => void,
   ): Promise<void> {
     while (true) {
+      if (ctx.signal?.aborted) throw new Error("[influx] 计划执行已中断(用户取消)")
       // 阻断传播(递归): 依赖失败/被阻断 -> blocked; 父节点 blocked -> 子节点也 blocked
+      // 被阻断节点也发 node-start/node-end 事件, 让 UI 能看到"谁被阻断、为什么"
       const blockedKeys = new Set<string>()
+      const blockedFibers: Fiber[] = []
       let dirty = true
       while (dirty) {
         dirty = false
@@ -320,6 +370,7 @@ export class Runtime {
             this.stats.blocked++
             this.blocked[f.key] = String(f.error)
             blockedKeys.add(f.key)
+            blockedFibers.push(f)
             dirty = true
           }
         }
@@ -331,14 +382,32 @@ export class Runtime {
         if (undone.length) {
           throw new Error(`[influx] deadlock: 依赖未满足 ${undone.map((f) => f.key).join(", ")}`)
         }
+        if (blockedFibers.length) {
+          // 全部被阻断(无可执行节点): 用一波事件把阻断原因展示出去
+          this.emitBlockedWave(blockedFibers, serial, onEvent)
+        }
         return
       }
 
       const wave: WaveInfo = { n: this.waves.length + 1, parallel: !serial, nodes: [], ms: 0 }
       onEvent?.({ type: "wave-start", n: wave.n, parallel: !serial })
+      // 预测式预取: 预热下一就绪前沿的读输入(后台, 不阻塞本波执行)
+      if (ctx.prefetch) {
+        const waveKeys = new Set(ready.map((f) => f.key))
+        const reads = this.nextFrontierReads(fibers, waveKeys, ctx.cwd)
+        if (reads.length) ctx.prefetch.warm(reads)
+      }
       const t0 = performance.now()
+      // 被阻断节点并入本波: 与就绪节点同时展示(它们在本轮迭代中被判定阻断)
+      for (const f of blockedFibers) {
+        onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: "blocked" })
+        onEvent?.({ type: "node-end", key: f.key, tool: f.tool, status: "blocked", ms: 0, error: String(f.error) })
+        wave.nodes.push({ key: f.key, tool: f.tool, ms: 0, status: "blocked", error: String(f.error) })
+      }
 
       const runOne = async (f: Fiber) => {
+        // 每节点独立 ctx: 注入节点 key(供 llm 节点流式区分)与中断信号
+        const nodeCtx: ToolCtx = { ...ctx, key: f.key }
         onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: f.status })
         const start = performance.now()
         try {
@@ -351,7 +420,7 @@ export class Runtime {
             let lastErr: unknown
             for (let attempt = 0; attempt <= retries; attempt++) {
               try {
-                f.result = await this.getTool(f.tool)(resolved, ctx)
+                f.result = await this.getTool(f.tool)(resolved, nodeCtx)
                 lastErr = undefined
                 break
               } catch (e) {
@@ -407,6 +476,19 @@ export class Runtime {
       onEvent?.({ type: "wave-end", n: wave.n, ms: wave.ms })
       this.waves.push(wave)
     }
+  }
+
+  /** 纯阻断波: 无节点可执行时, 把被阻断节点以事件形式展示(ms=0, 带 error) */
+  private emitBlockedWave(blocked: Fiber[], serial: boolean, onEvent?: (e: RuntimeEvent) => void): void {
+    const wave: WaveInfo = { n: this.waves.length + 1, parallel: !serial, nodes: [], ms: 0 }
+    onEvent?.({ type: "wave-start", n: wave.n, parallel: !serial })
+    for (const f of blocked) {
+      onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: "blocked" })
+      onEvent?.({ type: "node-end", key: f.key, tool: f.tool, status: "blocked", ms: 0, error: String(f.error) })
+      wave.nodes.push({ key: f.key, tool: f.tool, ms: 0, status: "blocked", error: String(f.error) })
+    }
+    onEvent?.({ type: "wave-end", n: wave.n, ms: 0 })
+    this.waves.push(wave)
   }
 }
 
@@ -727,7 +809,7 @@ function truthy(v: unknown): boolean {
 }
 
 /** 从工具结果提取简短人类可读摘要(供 UI 对话流展示) */
-function summarizeResult(result: unknown, tool: string): string | undefined {
+export function summarizeResult(result: unknown, tool: string): string | undefined {
   if (result === undefined || result === null) return undefined
   const r = result as Record<string, any>
   if (typeof result === "string") return truncateSummary(result, 160)

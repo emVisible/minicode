@@ -25,6 +25,7 @@
     "mcp": "tsx src/influx/mcp.ts",
     "smoke": "tsx test/smoke.ts",
     "smoke:influx": "tsx test/influx-smoke.ts",
+    "smoke:plan-fixes": "tsx test/plan-fixes.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.plans.json --noEmit"
   },
   "engines": {

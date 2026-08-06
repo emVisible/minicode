@@ -178,18 +178,34 @@ async function main(): Promise<void> {
 
   const { flags, promptArgs } = parseArgs(argv)
 
-  // 交互模式(默认): 启动 Ink TUI
+  // 交互模式(默认): 启动 Ink TUI(启动前检测终端主题, 注入 App)
   if (!flags.headless) {
     const { render } = await import("ink")
     const { default: App } = await import("./ui/app.tsx")
     const { createElement } = await import("react")
-    render(createElement(App, { cwd: flags.cwd }))
+    const { detectTerminalTheme } = await import("./ui/theme.ts")
+    const theme = await detectTerminalTheme()
+    // 全屏 TUI: 进入 alternate screen buffer(OSC 1049), 与调用它的终端会话完全解耦。
+    // 运行期间整屏由本 TUI 接管(不污染终端滚动历史); 退出时原样恢复调用方终端 ——
+    // 参考 tmux/opencode 的客户端模式: "独立的全屏应用, 而不是终端里的一条流"。
+    const isTty = process.stdout.isTTY
+    if (isTty) process.stdout.write("\x1b[?1049h")
+    let restored = false
+    const restore = (): void => {
+      if (restored || !isTty) return
+      restored = true
+      process.stdout.write("\x1b[?1049l\x1b[?25h")
+    }
+    process.on("exit", restore)
+    const instance = render(createElement(App, { cwd: flags.cwd, theme: theme ?? undefined }))
+    await instance.waitUntilExit()
+    restore()
     return
   }
 
   const rawPrompt = promptArgs.join(" ") || (process.stdin.isTTY ? "" : await readStdin())
   if (!rawPrompt) {
-    console.error("MiniCode v0.1: 未提供 prompt(可以用管道: echo '...' | minicode --headless)")
+    console.error("未提供 prompt(可以用管道: echo '...' | minicode --headless)")
     process.exit(1)
   }
 

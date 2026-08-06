@@ -23,26 +23,38 @@ Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式
   - 读类( read / glob / grep / http_get / http_post )默认放行;写类(write / edit)与命令(bash)触发确认(并行多工具时逐个排队确认)
   - 输出截断( read 50KB / bash 4000 字符 / grep 200 条 )
 - **界面**: 交互式 Ink TUI(输入框、权限确认队列[输入框保持可用, 输入 y 放行]、Esc 中断),以及 headless 模式(管道/stdin 单轮,TTY 下可交互确认)
-  - **打字机流式渲染**: SSE delta 进入打字机队列, 每 16ms 单字吐出(积压时小幅加速), 感知"逐字打出"而非分块涌入; 渲染只更新短字符串, 不触碰对话数组
-  - **Markdown 渲染**(`src/ui/markdown.tsx`): 标题(#)粗体青色、列表(•/1.)、代码块(``` 圆角边框)、引用(│)、行内 `code` 青色、**粗体**; 对话流与流式文本均支持
-  - **启动欢迎卡片**(`src/ui/welcome.tsx`): 圆角边框信息面板 —— 目录/模型/工具数/快捷键速查, 首条消息前展示
-  - **对话分隔符**: 角色切换时插入 `─── 你 ───` / `─── MiniCode ───` / `─── 工具 ───`, 单 session 多轮一目了然
-  - **组合式布局**: 左对话流 + 右任务树侧边栏, 各组件独立负责、组合拼接
-  - **任务树视图**: 对话执行渲染为树 —— 用户消息(根)→ 每轮波次(分支)→ 工具调用(同层兄弟=并行),状态符号 ○/◐/✓/✗ + 颜色区分,并行波次标注 `波次 N · M 并行`,执行过程"看得见"
+  - **设计原则**(A1-A7): ① 信息分三层永不混层 —— 内容(助手回答)/ 活动(工具执行)/ 系统(诊断)物理隔离;② 单一强调色(淡紫蓝)+ 中性灰阶, 语义色只在"裁定"时出现;③ 层级靠排印(字重/亮度/留白), 不用装饰边框;④ 信息密度自适应 —— 活动面板运行时展开(右 40%), 完成收回, 对话恢复全宽;⑤ 一切可回溯(Ctrl+d 诊断托盘);⑥ 统一间距节奏;⑦ 动效克制(打字机 + 单处 spinner)
+  - **主题**(`src/ui/theme.ts`): dark/light 两套设计令牌, 自动检测终端背景(`MINICODE_THEME=dark|light` 显式覆盖 / COLORFGBG / OSC 11 查询, 默认 dark)
+  - **打字机流式渲染**: SSE delta 进入打字机队列, 每 16ms 单字吐出(积压时小幅加速), 尾部未完成行以光标块 `▍` 闪烁; 渲染只更新短字符串
+  - **Markdown 渲染**(`src/ui/markdown.tsx`): 标题(字重分层,不显示 #)/ 无序·有序·任务·嵌套列表 / **表格**(CJK 全角宽度对齐)/ 代码块(左 rail + 微底色 + JSON/bash/TS 迷你高亮)/ 引用 rail / 分隔线(细发线)/ 行内 `code`、**bold**、*italic*、~~strike~~、链接; 宽度感知(活动面板展开时自动收窄)
+  - **启动欢迎卡片**(`src/ui/welcome.tsx`): wordmark + 命令网格, 首条消息前展示
+  - **消息呈现**: 用户消息带 `你` 头 + 右对齐时间戳; 助手消息左侧淡紫蓝 rail; 运行结论为单行裁定 `✓ 全并行 3 波 · 2.0s` + 变更明细(dim); 工具事件不再混入对话流
+  - **活动面板**(`src/ui/activity.tsx`): 运行时右 40% —— 波次 header(⚡ 并行数/✓ 完成数) + 节点行(○/◐/✓/✗ + 工具名 + 耗时); 运行中 Tab 焦点轮回: ↑↓ 选择、Enter 展开/收起节点输出、`e` 全展开、Esc 返回; 完成后收回为对话流内的结论行
+  - **全屏解耦**: 交互模式进入 alternate screen buffer(OSC 1049), TUI 独占整屏、不污染终端滚动历史; 退出时原样恢复调用方终端(参考 tmux/opencode 客户端模式)
+  - **Plan / Build 双模式**(Tab 切换): Plan 模式提交任务 → 只生成计划(DAG 骨架实时流式展示在活动面板, 不执行), 计划记入会话历史; Build 模式提交 → 完整执行(自动拆解 → VBuild → RBuild 确认落盘)。先想清楚, 再动手
+  - **任务树数据层**(`src/ui/tree.tsx`): 从运行事件增量构建(幂等), 渲染与数据分离
   - **`/plan <任务>`**: 让 LLM 把任务拆解为 DAG 计划, 交给 Influx 运行时**全并行执行**(无依赖节点同波并行, 依赖链自动串行) —— 对话理解 + 计划执行的"1+1>2"
-  - **thinking 过程可视化**: llm 节点的流式输出实时显示在任务树节点(实时 note), 节点完成后对话流输出 `📝 <节点> 输出:` 摘要 —— 执行过程全程可见
+  - **thinking 过程可视化**: 拆解阶段 LLM 生成的计划 JSON 流式显示在活动面板(实时滚动), 完成后对话流输出计划骨架摘要 —— 不再是"黑盒等待后突然出结果"
   - **拆解约束**: 拆解 LLM 禁止用 llm 节点做任务主体, 强制 agent.read/glob/grep + write-file 等文件工具; 纯分析 spec 自动回退对话执行
   - **`/vbuild <任务>` 两段式构建(VBuild → RBuild)**: 所有 write/edit 先进内存 overlay(VBuild, 虚拟文件系统 `src/vfs.ts`), 全程零磁盘副作用; 完成后展示 diff(+ 新建 / ~ 修改 / − 删除), 输入 y 才 **RBuild 并行批量落盘**, 输入 n 丢弃(可回滚)。`/plan` 同样走两段式
-  - 流式渲染独立于对话流(不触碰 lines 数组), 状态栏实时显示吞吐 `Nc/s`; 流式响应 60s 无数据自动报错(服务器挂起检测)
+  - 状态栏: 右侧实时显示 `⠋ 拆解中 / 执行中 ×N` + 吞吐 `Nc/s`; 流式响应 60s 无数据自动报错(服务器挂起检测)
+  - **诊断托盘**: `Ctrl+d` 展开/收起 —— 拆解失败原因、死循环警告、节点错误等默认折叠为细字, 信息永远可达但不占视觉
   - **内置设置面板**: TUI 内 `Ctrl+o`(或 `/config`)呼出,配置 LLM URL / API Key / Model,Enter 保存即生效并持久化到 `~/.minicode/config.json`(0600 权限,原子写);环境变量优先于配置文件
-- **双引擎自动分流**: 每条消息先尝试由 LLM 拆解为 Influx DAG(1 次快速调用), ≥2 个可并行节点 → 自动走 Influx 全并行执行(波次调度); 拆解失败/纯问答 → 回退对话循环。默认路径就吃上 Influx 并行能力, 无需手动 `/plan`
-- **终结条件**: stop(完成) / aborted(用户中断) / max_steps / doom_loop
+- **双引擎自动分流**: 每条消息先尝试由 LLM 拆解为 Influx DAG(1 次快速调用), ≥2 个可并行节点(文件/命令/远端 API) → 自动走 Influx 全并行执行(波次调度); 拆解失败/纯问答 → 回退对话循环。默认路径就吃上 Influx 并行能力, 无需手动 `/plan`
+  - 拆解**重试机制**: 首次返回非合法 JSON 时, 把模型自己的输出回喂让其修正(一次机会); 解析容错(剥 markdown 代码块/前后文字/单引号/尾逗号); 限时 90s
+- **预测式预取**(计划 = 模型对自身后续行为的预测): 拆解阶段 LLM 还在流式生成计划 JSON 时, 就把其中声明的 `read-file` 路径**并行预读**进缓存(IO 隐藏在 LLM 延迟之后); 执行阶段运行时在每波开始前**预热下一就绪前沿的读输入**(DAG 已知下波要读什么)。`read-file` 命中缓存直接返回(标记 `prefetched`), `write-file` 真实写入后自动作废对应缓存防过期
+- **拆解过程可视化**: LLM 生成计划 JSON 时流式显示在任务树占位节点(note 实时滚动), 完成后对话流输出 `📝 拆解分析:` 摘要 —— 不再是"黑盒等待后突然出结果"
+- **计划执行全链路可见**: 被阻断节点也发 node-start/node-end 事件(依赖失败原因展示在任务树); 执行结束输出「✓ 构建完成: N 波, 总耗时 Xs」+ VFS diff(相对路径)
+- **计划执行上下文不丢失**: runDual/`/plan` 执行后把「任务 + 每节点摘要 + 文件改动」合成一条助手消息记入会话历史, 下一条消息能接上
+- **Esc 中断贯穿计划执行**: AbortSignal 传入 Runtime 与 shell/http/llm 工具, 并行执行中按 Esc 即时中止
+- **终结条件**: stop(完成) / aborted(用户中断) / max_steps / doom_loop。死循环保护以**整批调用签名**为单位比较(只有整批与上一批完全一致才 +1): 波次内并行重复参数(如一步并行 read 同一文件两次)不会累积误杀, 真循环连续 3 波次先注入提示、警告后仍重复才中止
 
 ### Influx 计划运行时(`src/influx/`)
 
 - **运行时**(`core.ts`): mini-react 架构语义移植 — render(计划→fiber 任务树) → reconcile(与上一轮快照 diff: placement/update/skip) → commit(就绪前沿并行执行工具,统一提交结果) → 重规划(计划函数随状态重渲染,直到稳定)
 - **内置节点工具**(`tools.ts`): `http.get` / `http.post` / `shell` / `write-file` / `read-file` / `list-dir` / `llm`;计划文件可 `registerTool` 注册自定义工具
-  - **`llm` 节点支持 agent 模式**: 传 `tools` 数组(如 `["read", "bash"]`)则节点内跑完整 tool-call 回环(计划内嵌对话),返回 `{answer, steps, finish}`;不传则单问返回 `{answer}`。与对话侧共用同一 `LLMClient`
+  - 路径工具统一相对 `ctx.cwd` 解析; `read-file` 超 50KB 截断(对齐对话侧); `shell` 输出上限 10MB; 均支持用户中断信号
+  - **`llm` 节点支持 agent 模式**: 传 `tools` 数组(如 `["read", "bash"]`)则节点内跑完整 tool-call 回环(计划内嵌对话),返回 `{answer, steps, finish}`;流式输出按节点 key 分离(并行 llm 不串流),thinking 过程实时可见;不传则单问返回 `{answer}`。与对话侧共用同一 `LLMClient`
   - **反向桥接**: 对话工具以 `agent.read` / `agent.write` / `agent.edit` / `agent.bash` / `agent.glob` / `agent.grep` 注册进计划注册表,计划节点可直接使用(见 `examples/agent-demo.plan.tsx`)
 - **计划语言**: TSX + `/** @jsx task */` pragma(见 `examples/*.plan.tsx`),支持 `$key.path` 值引用、`when` 条件表达式、`dependsOn` 依赖、`fallback` 兜底、`retries` 重试
 - **增量缓存**: 参数未变的节点缓存命中,仅重跑变化分支;`--rerun` 可验证
@@ -68,6 +80,7 @@ pnpm webui                                  # 浏览器可视化执行过程
 pnpm mcp                                    # 启动 MCP 服务器(stdin/stdout)
 pnpm smoke                                  # 对话侧端到端冒烟(假 LLM server)
 pnpm smoke:influx                           # 计划侧 MCP 冒烟(缓存/阻断/fallback/retry/when)
+pnpm smoke:plan-fixes                       # 计划侧修复回归(history/中断/blocked 事件/引用/流式分离)
 pnpm typecheck                              # tsc 双配置: 应用 + 计划文件
 ```
 
@@ -98,9 +111,14 @@ src/
   vfs.ts             虚拟文件系统(VBuild/RBuild 两段式构建核心)
   tools.ts           对话工具注册(含 influx 桥接 http_get/http_post/llm)
   prompt.ts          系统提示词
-  ui/app.tsx         Ink TUI(消费 loop 事件)
+  ui/app.tsx         Ink TUI(双模式布局 + 结构化消息流 + 诊断托盘)
+  ui/theme.ts        设计令牌(dark/light 淡紫蓝) + 自动主题检测
+  ui/activity.tsx    活动面板(useActivity 事件桥 + 波次/节点渲染 + 焦点导航)
+  ui/markdown.tsx    终端 Markdown 渲染(表格/列表/代码高亮/rail)
+  ui/input.tsx       自定义输入行(Ctrl 组合键不插入文本)
   ui/settings.tsx    设置面板(Ctrl+o 呼出)
-  ui/tree.tsx        任务树视图(波次并行可视化)
+  ui/tree.tsx        任务树数据层(事件增量构建, 幂等)
+  ui/welcome.tsx     启动欢迎卡片(wordmark + 命令网格)
   ui/react-jsx.d.ts  全局 JSX shim(根 tsconfig 用 jsx preserve, 桥接 React.JSX)
   cli.ts             统一入口(TUI / headless / plan / mcp)
   influx/
@@ -127,7 +145,7 @@ test/influx-smoke.ts 计划侧 MCP 冒烟
 
 ## 验证门禁
 
-`pnpm typecheck && pnpm smoke && pnpm smoke:influx` 必须全绿。smoke 覆盖: 工具回环、回喂、doom-loop、坏参 JSON、权限拒绝;influx smoke 覆盖: 干跑预览、缓存命中、when 分支、错误阻断、fallback、retry、自动 key、重复 key 快速失败、llm 节点 agent 模式(tool_calls 回环)。
+`pnpm typecheck && pnpm smoke && pnpm smoke:influx && pnpm smoke:plan-fixes` 必须全绿。smoke 覆盖: 工具回环、回喂、doom-loop、坏参 JSON、权限拒绝;influx smoke 覆盖: 干跑预览、缓存命中、when 分支、错误阻断、fallback、retry、自动 key、重复 key 快速失败、llm 节点 agent 模式(tool_calls 回环);plan-fixes 覆盖: historyMessage 多轮上下文、signal 中断、blocked 节点事件可见、`{$k.output}` 引用非空、read-file 截断与 cwd 解析、多 llm 节点流式分离、http 节点走 Influx、拆解过程流式(onStream 收到 delta)。
 
 ## 未实现(明确不做/后续)
 

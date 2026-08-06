@@ -5,7 +5,10 @@
 import type { ChatMessage, LoopEvent, LoopOptions, ToolSpec } from "./types.ts"
 
 const DEFAULT_MAX_STEPS = 30
-const DOOM_LOOP_THRESHOLD = 3
+/** 同参数连续调用达到该次数时先注入警告(给模型一次换方式的机会) */
+const DOOM_WARN_THRESHOLD = 3
+/** 警告后仍继续相同调用达到该次数才硬中止(真死循环) */
+const DOOM_ABORT_THRESHOLD = 4
 /** 单次请求的上下文预算; 超限时丢弃最旧的非 system 消息 */
 const MAX_CONTEXT_BYTES = 128 * 1024
 
@@ -49,7 +52,8 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
   const messages: ChatMessage[] = [...input.history, input.userMessage]
   const toolMap = new Map(input.tools.map((t) => [t.name, t]))
   const specs: ToolSpec[] = input.tools.map(({ name, description, parameters }) => ({ name, description, parameters }))
-  const doomCounts = new Map<string, number>()
+  let lastBatchKey = ""
+  let consecutive = 0
   let steps = 0
 
   while (true) {
@@ -74,18 +78,34 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
       return { messages, finish: "stop", steps }
     }
 
-    // doom-loop 保护: 同工具同一参数连续 N 次视为死循环
-    for (const call of calls) {
-      const key = `${call.function.name}:${call.function.arguments}`
-      const n = (doomCounts.get(key) ?? 0) + 1
-      doomCounts.set(key, n)
-      if (n >= DOOM_LOOP_THRESHOLD) {
-        messages.push({
-          role: "assistant",
-          content: `检测到死循环: 工具 ${call.function.name} 以相同参数连续调用 ${n} 次, 已中止。请换一种方式。`,
-        })
-        return { messages, finish: "doom_loop", steps }
-      }
+    // doom-loop 保护: 以「整批调用签名」为单位比较, 而不是单个调用。
+    // 原因: 模型在并行波次里常常重复参数(如一步里并行 read 同一文件两次),
+    // 按调用逐个计数会把「一个波次内的冗余」误算成连续重复, 两步就触发中止。
+    // 现在: 只有整批调用与上一批完全一致(真循环)才 +1; 波次内重复不再累积。
+    // 分级: 连续 3 次先注入警告(模型可能只是没注意到), 警告后仍重复才中止。
+    const batchKey = calls.map((c) => `${c.function.name}:${c.function.arguments}`).join("\u0000")
+    consecutive = batchKey === lastBatchKey ? consecutive + 1 : 1
+    lastBatchKey = batchKey
+    const first = calls[0]!
+    if (consecutive >= DOOM_ABORT_THRESHOLD) {
+      messages.push({
+        role: "assistant",
+        content: `检测到死循环: 工具 ${first.function.name} 以相同参数连续 ${consecutive} 波次重复调用(警告后仍未改变), 已中止。请换一种方式。`,
+      })
+      return { messages, finish: "doom_loop", steps }
+    }
+    if (consecutive === DOOM_WARN_THRESHOLD) {
+      // 针对常见循环的具体建议, 引导模型走出重复
+      const hint =
+        first.function.name === "read"
+          ? "该路径可能已读取过, 请直接基于已有内容继续(修改/写入/总结), 或改用 glob/grep 精确定位"
+          : first.function.name === "bash"
+            ? "该命令可能未达到预期, 请检查上一步输出并换一个命令, 不要原样重跑"
+            : "请基于已有结果继续下一步, 不要重复相同调用"
+      messages.push({
+        role: "assistant",
+        content: `提示: 工具 ${first.function.name} 已连续 ${consecutive} 个波次使用相同参数调用, 疑似重复。${hint}。若再重复相同调用将中止任务。`,
+      })
     }
 
     // 本轮所有 tool_calls 是一个"波次"(树的同一层): 兄弟节点并行执行

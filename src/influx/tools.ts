@@ -5,6 +5,7 @@
 import { exec as execCb } from "node:child_process"
 import { promisify } from "node:util"
 import { Agent, request as uRequest } from "undici"
+import { resolve } from "node:path"
 import type { ToolCtx } from "./core.ts"
 import { createLLMClient, resolveEndpoint } from "../llm.ts"
 
@@ -33,18 +34,18 @@ export function listTools(): Array<{ name: string; desc?: string }> {
 
 registerTool(
   "http.get",
-  async ({ url, headers, timeoutMs = 30000 }) => {
+  async ({ url, headers, timeoutMs = 30000 }, ctx) => {
     if (!url) throw new Error("[http.get] 缺少 url")
-    return request("GET", { url, headers, timeoutMs })
+    return request("GET", { url, headers, timeoutMs }, ctx.signal)
   },
   "GET 远端 API, 参数: url(必填), headers, timeoutMs; 返回 {status, headers, body}",
 )
 
 registerTool(
   "http.post",
-  async ({ url, headers, body, timeoutMs = 30000 }) => {
+  async ({ url, headers, body, timeoutMs = 30000 }, ctx) => {
     if (!url) throw new Error("[http.post] 缺少 url")
-    return request("POST", { url, headers, body, timeoutMs })
+    return request("POST", { url, headers, body, timeoutMs }, ctx.signal)
   },
   "POST 远端 API, 参数: url(必填), headers, body, timeoutMs; 返回 {status, headers, body}",
 )
@@ -52,13 +53,16 @@ registerTool(
 async function request(
   method: string,
   { url, headers, body, timeoutMs }: { url: string; headers?: Record<string, string>; body?: unknown; timeoutMs: number },
+  signal?: AbortSignal,
 ) {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
   const res = await uRequest(url, {
     method,
     headers: { "user-agent": "influx/0.3", ...(headers ?? {}) },
     body: body !== undefined ? JSON.stringify(body) : undefined,
     dispatcher: agent,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: combined,
   })
   const text = await res.body.text()
   let parsed: unknown = text
@@ -77,9 +81,14 @@ const exec = promisify(execCb)
 
 registerTool(
   "shell",
-  async ({ cmd, timeoutMs = 30000 }) => {
+  async ({ cmd, timeoutMs = 30000 }, ctx) => {
     if (!cmd) throw new Error("[shell] 缺少 cmd")
-    const { stdout, stderr } = await exec(cmd, { timeout: timeoutMs })
+    const { stdout, stderr } = await exec(cmd, {
+      timeout: timeoutMs,
+      cwd: ctx.cwd,
+      maxBuffer: 10 * 1024 * 1024,
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    })
     const out = stdout.trim()
     return { stdout: out, stderr: stderr.trim(), exitCode: 0, output: out }
   },
@@ -103,15 +112,23 @@ registerTool(
       } else {
         ctx.vfs.write(abs, content)
       }
-      return { ok: true, path, bytes: Buffer.byteLength(content), append, vbuild: true, output: content }
+      return { ok: true, path: abs, bytes: Buffer.byteLength(content), append, vbuild: true, output: content }
     }
-    mkdirSync(dirname(path), { recursive: true })
-    if (append) appendFileSync(path, content, "utf8")
-    else writeFileSync(path, content, "utf8")
-    return { ok: true, path, bytes: statSync(path).size, append, output: content }
+    const abs = resolvePath(ctx.cwd, path)
+    mkdirSync(dirname(abs), { recursive: true })
+    if (append) appendFileSync(abs, content, "utf8")
+    else writeFileSync(abs, content, "utf8")
+    // 真实写入后作废预取缓存(防止后续 read-file 命中过期内容)
+    ctx.prefetch?.invalidate(abs)
+    return { ok: true, path: abs, bytes: statSync(abs).size, append, output: content }
   },
   "写文件(自动建目录), 参数: path(必填), content, append; 返回 {ok, path, bytes, output}; VBuild 模式下写入内存 overlay",
 )
+
+// 相对 ctx.cwd 解析路径(与对话侧 read/write 一致)
+function resolvePath(cwd: string, p: string): string {
+  return resolve(cwd, p)
+}
 
 registerTool(
   "read-file",
@@ -122,24 +139,40 @@ registerTool(
     if (ctx.vfs) {
       const abs = ctx.vfs.abs(path)
       if (ctx.vfs.has(abs)) {
-        const content = ctx.vfs.read(abs)
-        return { exists: true, path: abs, content, output: content, bytes: Buffer.byteLength(content), vbuild: true }
+        const content = truncateFile(ctx.vfs.read(abs), abs)
+        return { exists: true, path: abs, content, output: content, bytes: Buffer.byteLength(content), vbuild: true, truncated: content.length < ctx.vfs.read(abs).length }
       }
       return { exists: false, path: abs, output: "", vbuild: true }
     }
-    if (!existsSync(path)) return { exists: false, path, output: "" }
-    const content = readFileSync(path, "utf8")
-    return { exists: true, path, content, output: content, bytes: statSync(path).size }
+    const abs = resolvePath(ctx.cwd, path)
+    // 预测式预取命中: 该文件在本波开始前已被后台预读(上一波执行期间)
+    const cached = ctx.prefetch?.get(abs)
+    if (cached !== undefined) {
+      const content = truncateFile(cached, abs)
+      return { exists: true, path: abs, content, output: content, bytes: Buffer.byteLength(content), prefetched: true, truncated: content.length < cached.length }
+    }
+    if (!existsSync(abs)) return { exists: false, path: abs, output: "" }
+    const full = readFileSync(abs, "utf8")
+    const content = truncateFile(full, abs)
+    return { exists: true, path: abs, content, output: content, bytes: statSync(abs).size, truncated: content.length < full.length }
   },
-  "读文件, 参数: path(必填); 返回 {exists, path, content, output, bytes}; VBuild 模式下读 overlay",
+  "读文件, 参数: path(必填); 返回 {exists, path, content, output, bytes}; VBuild 模式下读 overlay; 超 50KB 截断(truncated)",
 )
+
+// read-file 输出截断(对齐对话侧 read 的 50KB 上限, 防止大文件撑爆 {$k.output} 引用与 llm 节点上下文)
+function truncateFile(content: string, path: string): string {
+  const MAX = 50 * 1024
+  if (content.length <= MAX) return content
+  return content.slice(0, MAX) + `\n...(输出过长已截断, 共 ${content.length} 字符, 文件: ${path})`
+}
 
 registerTool(
   "list-dir",
-  async ({ path, recursive = false }) => {
+  async ({ path, recursive = false }, ctx) => {
     const { readdirSync } = await import("node:fs")
     const { join } = await import("node:path")
     if (!path) throw new Error("[list-dir] 缺少 path")
+    const root = resolvePath(ctx.cwd, path)
     const files: string[] = []
     const dirs: string[] = []
     const scan = (dir: string, prefix: string) => {
@@ -152,8 +185,8 @@ registerTool(
         }
       }
     }
-    scan(path, "")
-    return { root: path, files, dirs }
+    scan(root, "")
+    return { root, files, dirs }
   },
   "列出目录, 参数: path(必填), recursive; 返回 {root, files, dirs}",
 )
@@ -198,6 +231,8 @@ registerTool(
     }
 
     // 单问模式: 复用与对话侧完全相同的流式客户端; 流式 delta 转发给 UI(thinking 过程)
+    // 用节点 key 区分多个 llm 节点的流(并行 llm 不串流)
+    const key = ctx.key ?? "llm"
     const res = await client.stream({
       messages: [
         ...(system ? [{ role: "system" as const, content: system }] : []),
@@ -206,8 +241,9 @@ registerTool(
       tools: [],
       model,
       temperature,
+      signal: ctx.signal,
       onEvent: (e) => {
-        if (e.type === "text-delta" && ctx.onStream) ctx.onStream("llm", e.text)
+        if (e.type === "text-delta" && ctx.onStream) ctx.onStream(key, e.text)
       },
     })
     if (res.message.tool_calls?.length) throw new Error("[llm] 意外收到 tool_calls(未传 tools)")

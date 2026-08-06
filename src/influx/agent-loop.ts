@@ -42,7 +42,12 @@ export async function runAgentLoop(opts: AgentLoopOpts): Promise<{ answer: strin
     cwd: ctx.cwd,
     requests: (o) => client.stream(o),
     ask: ctx.ask,
-    onEvent: () => {},
+    ...(ctx.vfs ? { vfs: ctx.vfs } : {}),
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
+    // 内嵌 agent 的流式文本桥接为节点 thinking 输出(与单问 llm 节点一致)
+    onEvent: (e) => {
+      if (e.type === "text" && ctx.onStream) ctx.onStream(ctx.key ?? "llm", e.text)
+    },
   })
 
   const answers = result.messages.filter((m) => m.role === "assistant" && !m.tool_calls?.length && m.content)

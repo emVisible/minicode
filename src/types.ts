@@ -102,6 +102,23 @@ export interface TaskNode {
   children: TaskNode[]
 }
 
+// ---------- 对话流结构化消息 ----------
+// 内容层与活动/系统层物理隔离(A1): 对话流只承载内容与结论。
+
+export type ChatMsg =
+  | { kind: "user"; text: string; ts: number }
+  | { kind: "assistant"; text: string; ts: number }
+  | { kind: "verdict"; text: string; ok: boolean; detail?: string[]; ts: number }
+  | { kind: "danger"; text: string; detail?: string[]; ts: number }
+  | { kind: "info"; text: string; detail?: string[]; ts: number }
+
+/** 诊断托盘条目(Ctrl+d 展开, 默认折叠为细字) */
+export interface DiagLine {
+  ts: number
+  level: "info" | "warn" | "err"
+  text: string
+}
+
 // ---------- 循环 ----------
 
 export interface LoopOptions {
