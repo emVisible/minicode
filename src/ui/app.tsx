@@ -14,6 +14,7 @@ import { createLLMClient } from "../llm.ts"
 import { saveConfig, applyConfigToEnv, configPath } from "../config.ts"
 import { SettingsPanel } from "./settings.tsx"
 import { TaskTree, upsertWave, updateTool, markWave } from "./tree.tsx"
+import { renderMarkdown } from "./markdown.tsx"
 import type { MinicodeConfig } from "../config.ts"
 import type { ChatMessage, LoopEvent, TaskNode, ToolDef } from "../types.ts"
 
@@ -44,11 +45,14 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const historyRef = useRef<ChatMessage[]>([])
   const controllerRef = useRef<AbortController | null>(null)
   const askQueueRef = useRef<Array<{ req: { tool: string; summary: string }; resolve: (v: boolean) => void }>>([])
-  /** 流式文本节流: SSE delta 频繁到来, 批量合并后按帧渲染, 避免每 chunk 一次全量 setState */
-  const streamBufRef = useRef("")
-  const streamTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const STREAM_FLUSH_MS = 30
-  /** 流式文本独立渲染: 不写入 lines 数组, 只更新短 state, 避免长会话全量 diff */
+  /**
+   * 打字机流式渲染: SSE delta 不断追加到 target, 定时器按单字推进 shown,
+   * streamText = target.slice(0, shown)。感知是"逐字打出", 而不是分块涌入。
+   * 渲染只更新一个短字符串, 不触碰 lines 数组。
+   */
+  const typeRef = useRef({ target: "", shown: 0 })
+  const typeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const TYPE_INTERVAL_MS = 16
   const [streamText, setStreamText] = useState("")
   /** 流式速率诊断: 每秒收到字符数(区分网络慢 vs 渲染慢) */
   const [cps, setCps] = useState(0)
@@ -77,31 +81,41 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     setLines((prev) => [...prev, line])
   }
 
-  /** 流式文本实时渲染: 只更新短 state(streamText), 不触碰 lines 数组 */
-  function flushStream(): void {
-    if (streamTimerRef.current) {
-      clearTimeout(streamTimerRef.current)
-      streamTimerRef.current = null
+  /** 打字机 tick: 每 16ms 推进一个字符(打字机手感); 积压超阈值时小幅加速保持跟手 */
+  function typeTick(): void {
+    typeTimerRef.current = null
+    const st = typeRef.current
+    if (st.shown >= st.target.length) return
+    const pending = st.target.length - st.shown
+    const step = pending > 400 ? 3 : pending > 200 ? 2 : 1
+    st.shown = Math.min(st.target.length, st.shown + step)
+    setStreamText(st.target.slice(0, st.shown))
+    if (st.shown < st.target.length) {
+      typeTimerRef.current = setTimeout(typeTick, TYPE_INTERVAL_MS)
     }
-    const text = streamBufRef.current
-    if (!text) return
-    streamBufRef.current = ""
-    setStreamText((prev) => prev + text)
   }
 
-  /** 一轮完成/工具调用时, 把已累积的流式文本固化进对话流 */
-  function commitStream(): void {
-    if (streamTimerRef.current) {
-      clearTimeout(streamTimerRef.current)
-      streamTimerRef.current = null
+  /** SSE delta 到达: 追加到打字机目标, 由 tick 逐字吐出 */
+  function pushType(text: string): void {
+    const st = typeRef.current
+    st.target += text
+    if (!typeTimerRef.current && st.shown < st.target.length) {
+      typeTimerRef.current = setTimeout(typeTick, TYPE_INTERVAL_MS)
     }
-    const text = streamBufRef.current
-    streamBufRef.current = ""
-    const existing = streamText
-    if (existing) setStreamText("")
-    const full = existing + text
-    if (!full) return
-    setLines((prev) => [...prev, { kind: "assistant", text: full }])
+  }
+
+  /** 一轮完成/工具调用时, 把打字机已累积文本固化进对话流 */
+  function commitStream(): void {
+    if (typeTimerRef.current) {
+      clearTimeout(typeTimerRef.current)
+      typeTimerRef.current = null
+    }
+    const st = typeRef.current
+    const full = st.target
+    st.target = ""
+    st.shown = 0
+    setStreamText("")
+    if (full) setLines((prev) => [...prev, { kind: "assistant", text: full }])
   }
 
   /** 权限确认队列: 并行工具调用可能同时触发多个 ask, 逐个展示 */
@@ -166,8 +180,8 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         setStep(e.n)
         return
       case "text": {
-        // 只累积到缓冲区, 由定时器批量提交到 streamText(不触碰 lines)
-        streamBufRef.current += e.text
+        // 打字机: 追加到目标, 由 tick 逐字吐出(感知单字流动)
+        pushType(e.text)
         // 速率统计: 1s 窗口内的字符数
         const now = performance.now()
         const c = cpsRef.current
@@ -176,9 +190,6 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
           setCps(Math.round(c.chars / ((now - c.last) / 1000)))
           c.chars = 0
           c.last = now
-        }
-        if (!streamTimerRef.current) {
-          streamTimerRef.current = setTimeout(flushStream, STREAM_FLUSH_MS)
         }
         return
       }
@@ -567,16 +578,33 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
       {/* 组合式布局: 上部 = 对话流 + 树侧边栏; 下部 = 输入行 */}
       <Box flexDirection="row" width="100%">
         <Box flexDirection="column" alignItems="flex-start" flexGrow={1} width="50%">
-          {lines.map((line, i) => (
-            <Text key={i} color={colorFor(line.kind)}>
-              {prefixFor(line.kind)}
-              {line.text}
-            </Text>
-          ))}
+          {lines.map((line, i) => {
+            const prev = lines[i - 1]
+            const isNewTurn = !prev || roleOf(prev.kind) !== roleOf(line.kind)
+            const prefix = prefixFor(line.kind)
+            return (
+              <Box key={i} flexDirection="column" width="100%">
+                {isNewTurn && prefix && <Text color="gray">─── {prefix.trim()} ───</Text>}
+                {line.kind === "assistant" ? (
+                  <Box flexDirection="column" width="100%">
+                    {renderMarkdown(line.text)}
+                  </Box>
+                ) : (
+                  <Text color={colorFor(line.kind)} wrap="wrap">
+                    {line.text}
+                  </Text>
+                )}
+              </Box>
+            )
+          })}
           {streamText && (
-            <Text color="white" wrap="wrap">
-              {streamText}
-            </Text>
+            <Box flexDirection="column" width="100%">
+              {/* 打字机: 完整行走 markdown, 尾部未完成行当普通文本(避免半截代码块抖动) */}
+              {renderMarkdown(streamText.slice(0, streamText.lastIndexOf("\n") + 1))}
+              {streamText.slice(streamText.lastIndexOf("\n") + 1) && (
+                <Text color="white">{streamText.slice(streamText.lastIndexOf("\n") + 1)}</Text>
+              )}
+            </Box>
           )}
         </Box>
         {tree && tree.children.length > 0 && (
@@ -637,17 +665,32 @@ function colorFor(kind: Line["kind"]): string {
   }
 }
 
+/** 角色分组: 相同角色连续渲染时不分隔 */
+function roleOf(kind: Line["kind"]): string {
+  switch (kind) {
+    case "user":
+      return "user"
+    case "assistant":
+      return "assistant"
+    case "tool-start":
+    case "tool-result":
+      return "tool"
+    case "error":
+      return "error"
+  }
+}
+
 function prefixFor(kind: Line["kind"]): string {
   switch (kind) {
     case "user":
-      return "你: "
-    case "tool-start":
-      return "◆ "
-    case "tool-result":
-      return "  "
+      return "你"
     case "assistant":
-      return ""
+      return "MiniCode"
+    case "tool-start":
+      return "工具"
+    case "tool-result":
+      return "工具"
     case "error":
-      return "⚠ "
+      return "错误"
   }
 }
