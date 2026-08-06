@@ -51,7 +51,7 @@ examples/*.plan.tsx      4 个可跑示例(demo/shell/fs-demo/llm-demo)
 
 ## 4. 已知限制 / 技术债
 
-- **真实 LLM 端到端未验证**: 环境无 `LLM_URL`,对话侧与计划 agent 模式只有假 server 冒烟。接真实模型: 配置 `LLM_URL`/`LLM_API_KEY` 后人工验证 TUI 一轮 + `pnpm demo:agent`。
+- **真实 LLM 端到端未验证**: 环境无 `LLM_URL`,对话侧与计划 agent 模式只有假 server 冒烟。接真实模型: TUI 内 `Ctrl+o` 设置面板配置,或注入 `LLM_URL` 后人工验证 TUI 一轮 + `pnpm demo:agent`。
 - 上下文压缩是**体积截断**(丢最旧+标记),无语义摘要(摘要化列为 W2)。
 - influx 的 `llm` 节点与对话侧已共用 `LLMClient`(v0.4 合并),但 `http.*` 节点仍走 undici(与对话侧 fetch 双栈,低风险)。
 - influx `http.*` 节点失败以 throw 为语义,无 4xx 结果返回。
@@ -60,6 +60,7 @@ examples/*.plan.tsx      4 个可跑示例(demo/shell/fs-demo/llm-demo)
 - MCP `influx_run` 无 AbortSignal/取消;状态仅进程内生命周期。
 - 两个 tsconfig 程序并存: 新计划文件必须放 `examples/`(JSX 类型冲突)。
 - `--cwd` 无等号 bug 已修复(v0.4);headless 在 TTY 下可交互确认,管道下仍默认拒绝。
+- 设置面板尚无 provider 端点下拉/模型列表(纯手动输入);API Key 在编辑态明文显示(失焦掩码)。
 
 ## 5. 后续规划(按优先级;长期波次见 ROADMAP)
 
@@ -72,6 +73,7 @@ examples/*.plan.tsx      4 个可跑示例(demo/shell/fs-demo/llm-demo)
 - [x] 合并两份 LLM 实现(influx llm 节点复用 `LLMClient`)
 - [x] `--cwd` 无等号 bug、headless TTY 确认、TUI 多 ask 排队
 - [x] 删除死代码(ContentDelta / LoopOutcome / 未用 StreamEvent 变体)
+- [x] TUI 内置设置面板(`Ctrl+o` / `/config`): 配置 LLM URL/API Key/Model,保存即生效,持久化 `~/.minicode/config.json`(原子写 + 0600 + 防御加载 + env 优先)
 
 ### P0 — 基线稳定
 - [ ] 接真实 LLM 人工验证对话 + 计划 agent 模式(`pnpm demo:agent`)

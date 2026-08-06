@@ -20,6 +20,7 @@ Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式
   - 读类( read / glob / grep / http_get / http_post )默认放行;写类(write / edit)与命令(bash)触发确认(并行多工具时逐个排队确认)
   - 输出截断( read 50KB / bash 4000 字符 / grep 200 条 )
 - **界面**: 交互式 Ink TUI(输入框、流式文本渲染、工具调用状态、权限确认队列、Esc 中断),以及 headless 模式(管道/stdin 单轮,TTY 下可交互确认)
+  - **内置设置面板**: TUI 内 `Ctrl+o`(或 `/config`)呼出,配置 LLM URL / API Key / Model,Enter 保存即生效并持久化到 `~/.minicode/config.json`(0600 权限,原子写);环境变量优先于配置文件
 - **终结条件**: stop(完成) / aborted(用户中断) / max_steps / doom_loop
 
 ### Influx 计划运行时(`src/influx/`)
@@ -63,7 +64,7 @@ minicode plan bench <plan.tsx>  [--max-iter=N]
 minicode plan view <plan.tsx>   [--serial] [--max-iter=N] [--no-open]
 ```
 
-环境变量:
+环境变量(也可在 TUI 设置面板中配置,保存到 `~/.minicode/config.json`):
 
 ```
 LLM_URL=/chat/completions 兼容端点(必填)
@@ -76,11 +77,13 @@ LLM_MODEL=默认 "gpt-4o-mini"
 ```
 src/
   types.ts           单一真相源类型(消息/工具/事件)
+  config.ts          用户配置(~/.minicode/config.json, 原子写/防御加载/0600)
   llm.ts             SSE 流式客户端(零网络库, 自解析)
   loop.ts            Agent 主循环(与 UI 解耦, 事件回调)
   tools.ts           对话工具注册(含 influx 桥接 http_get/http_post/llm)
   prompt.ts          系统提示词
   ui/app.tsx         Ink TUI(消费 loop 事件)
+  ui/settings.tsx    设置面板(Ctrl+o 呼出)
   ui/react-jsx.d.ts  全局 JSX shim(根 tsconfig 用 jsx preserve, 桥接 React.JSX)
   cli.ts             统一入口(TUI / headless / plan / mcp)
   influx/

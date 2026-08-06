@@ -13,6 +13,7 @@ import { builtinTools } from "./tools.ts"
 import { createLLMClient } from "./llm.ts"
 import { runAgent } from "./loop.ts"
 import { buildSystemPrompt } from "./prompt.ts"
+import { loadConfig, applyConfigToEnv } from "./config.ts"
 import { parsePlanFlags, planUsage, runPlanFile, benchPlanFile, viewPlanFile } from "./influx/plan-cli.ts"
 import type { PlanCliFlags } from "./influx/plan-cli.ts"
 
@@ -150,6 +151,8 @@ async function runAgentOnce(flags: CliFlags, rawPrompt: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // 启动即加载用户配置: 填充未设置的环境变量(环境变量优先)
+  applyConfigToEnv(loadConfig())
   const argv = process.argv.slice(2)
 
   // 子命令分发: plan / run / bench / view / mcp

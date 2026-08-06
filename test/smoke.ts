@@ -171,6 +171,40 @@ const scenario4: Scenario = {
 async function main(): Promise<void> {
   console.log("MiniCode smoke")
 
+  // 配置模块: 原子写(0600) / 往返 / env 注入 / env 优先 / 损坏回退
+  {
+    const { mkdtempSync, writeFileSync, rmSync, statSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "minicode-cfg-"))
+    const orig = process.env.MINICODE_CONFIG
+    process.env.MINICODE_CONFIG = join(dir, "config.json")
+    const { loadConfig, saveConfig, applyConfigToEnv } = await import("../src/config.ts")
+    saveConfig({ llmUrl: "https://api.example.com/v1", llmApiKey: "sk-test", llmModel: "test-model" })
+    const mode = (statSync(process.env.MINICODE_CONFIG).mode & 0o777).toString(8)
+    check("配置原子写 0600", mode === "600", `mode=${mode}`)
+    const cfg = loadConfig()
+    check(
+      "配置往返一致",
+      cfg.llmUrl === "https://api.example.com/v1" && cfg.llmApiKey === "sk-test" && cfg.llmModel === "test-model",
+      JSON.stringify(cfg),
+    )
+    delete process.env.LLM_URL
+    delete process.env.LLM_MODEL
+    applyConfigToEnv(cfg)
+    check("配置注入 env", process.env.LLM_URL === "https://api.example.com/v1" && process.env.LLM_MODEL === "test-model")
+    process.env.LLM_MODEL = "manual-model"
+    applyConfigToEnv(cfg)
+    check("env 优先于配置", process.env.LLM_MODEL === "manual-model", `model=${process.env.LLM_MODEL}`)
+    writeFileSync(process.env.MINICODE_CONFIG, "{broken", "utf8")
+    check("损坏配置回退空", JSON.stringify(loadConfig()) === "{}")
+    if (orig !== undefined) process.env.MINICODE_CONFIG = orig
+    else delete process.env.MINICODE_CONFIG
+    delete process.env.LLM_URL
+    delete process.env.LLM_MODEL
+    rmSync(dir, { recursive: true, force: true })
+  }
+
   // 场景 1: write 被调用 → 工具结果回喂 → 模型给出最终文本
   {
     const s = await runScenario(scenario1, "请创建文件 /tmp/minicode-smoke-1.txt 内容为 hello mini")

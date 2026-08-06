@@ -1,5 +1,6 @@
-// Ink TUI 根组件 —— 输入框 + 会话消息流 + 工具调用状态行
+// Ink TUI 根组件 —— 输入框 + 会话消息流 + 工具调用状态行 + 设置面板
 // 交互: Enter 提交, Esc 中断当前轮(空闲时退出), /quit 退出, /reset 清空会话
+// 设置: Ctrl+o 或 /config 呼出设置面板(配置 LLM_URL / API Key / Model, 保存即生效并持久化)
 
 import React from "react"
 import { useEffect, useMemo, useRef, useState } from "react"
@@ -10,7 +11,9 @@ import { runAgent } from "../loop.ts"
 import { buildSystemPrompt } from "../prompt.ts"
 import { builtinTools } from "../tools.ts"
 import { createLLMClient } from "../llm.ts"
-
+import { saveConfig, applyConfigToEnv, configPath } from "../config.ts"
+import { SettingsPanel } from "./settings.tsx"
+import type { MinicodeConfig } from "../config.ts"
 import type { ChatMessage, LoopEvent, ToolDef } from "../types.ts"
 
 interface Line {
@@ -31,6 +34,9 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const [busy, setBusy] = useState(false)
   const [step, setStep] = useState(0)
   const [ask, setAsk] = useState<{ tool: string; summary: string } | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [configDraft, setConfigDraft] = useState<MinicodeConfig>({})
+  const [configField, setConfigField] = useState(0)
   const linesRef = useRef<Line[]>([])
   const historyRef = useRef<ChatMessage[]>([])
   const controllerRef = useRef<AbortController | null>(null)
@@ -62,6 +68,41 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     cur?.resolve(allow)
     setAsk(askQueueRef.current[0]?.req ?? null)
   }
+
+  /** 打开设置面板: 从当前环境快照编辑草稿; 清掉 Ctrl+o 可能被 TextInput 吞入的字符 */
+  function openConfig(): void {
+    setInput("")
+    setConfigDraft({
+      llmUrl: process.env.LLM_URL ?? process.env.API_URL ?? "",
+      llmApiKey: process.env.LLM_API_KEY ?? process.env.API_KEY ?? "",
+      llmModel: process.env.LLM_MODEL ?? "",
+    })
+    setConfigField(0)
+    setSettingsOpen(true)
+  }
+
+  /** 保存设置: 写配置 + 注入环境变量(立即生效) */
+  function saveConfigPanel(): void {
+    const cfg: MinicodeConfig = {
+      llmUrl: configDraft.llmUrl?.trim() || undefined,
+      llmApiKey: configDraft.llmApiKey?.trim() || undefined,
+      llmModel: configDraft.llmModel?.trim() || undefined,
+    }
+    saveConfig(cfg)
+    applyConfigToEnv(cfg)
+    setSettingsOpen(false)
+    setInput("")
+    appendLine({
+      kind: "tool-result",
+      text: `✓ 设置已保存并生效 (${configPath()})`,
+    })
+  }
+
+  const CONFIG_FIELDS: Array<{ key: keyof MinicodeConfig; label: string; placeholder: string; secret?: boolean }> = [
+    { key: "llmUrl", label: "LLM URL", placeholder: "https://api.openai.com/v1" },
+    { key: "llmApiKey", label: "API Key", placeholder: "sk-...", secret: true },
+    { key: "llmModel", label: "Model", placeholder: "gpt-4o-mini" },
+  ]
 
   function handleEvent(e: LoopEvent): void {
     switch (e.type) {
@@ -144,6 +185,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
       setLines([])
       return
     }
+    if (trimmed === "/config") {
+      openConfig()
+      setInput("")
+      return
+    }
     if (busy) {
       appendLine({ kind: "error", text: "上一轮仍在运行, 按 Esc 中断后再输入" })
       return
@@ -153,6 +199,23 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   }
 
   useInput((_input, key) => {
+    if (settingsOpen) {
+      if (key.escape) {
+        setSettingsOpen(false)
+        setInput("")
+      } else if (key.tab || key.downArrow) {
+        setConfigField((f) => (f + 1) % CONFIG_FIELDS.length)
+      } else if (key.upArrow) {
+        setConfigField((f) => (f + CONFIG_FIELDS.length - 1) % CONFIG_FIELDS.length)
+      } else if (key.return) {
+        saveConfigPanel()
+      }
+      return
+    }
+    if (key.ctrl && _input.toLowerCase() === "o") {
+      openConfig()
+      return
+    }
     if (key.escape) {
       if (busy) controllerRef.current?.abort()
       else exit()
@@ -162,7 +225,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   useEffect(() => {
     appendLine({
       kind: "assistant",
-      text: `MiniCode · 工作目录: ${cwd} · 模型: ${process.env.LLM_MODEL ?? "默认"} · 回车提交 / Esc 中断 / /quit 退出`,
+      text: `MiniCode · 工作目录: ${cwd} · 模型: ${process.env.LLM_MODEL ?? "默认"} · Ctrl+o 设置 / 回车提交 / Esc 中断 / /quit 退出`,
     })
   }, [cwd])
 
@@ -176,21 +239,32 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
           </Text>
         ))}
       </Box>
-      <Box marginTop={1} flexDirection="row">
-        <Text color="gray">{busy ? `[${step}]` : ">"} </Text>
-        {ask ? (
-          <Text color="yellow" bold>
-            允许 {ask.tool}? {ask.summary} (y=放行 / 其他=拒绝)
-          </Text>
-        ) : (
-          <TextInput
-            value={input}
-            focus
-            placeholder={busy ? "运行中…(Esc 中断)" : "输入指令"}
-            onChange={setInput}
-            onSubmit={submit}
-          />
-        )}
+      {settingsOpen ? (
+        <SettingsPanel
+          draft={configDraft}
+          field={configField}
+          onChange={(key, value) => setConfigDraft((d) => ({ ...d, [key]: value }))}
+        />
+      ) : (
+        <Box marginTop={1} flexDirection="row">
+          <Text color="gray">{busy ? `[${step}]` : ">"} </Text>
+          {ask ? (
+            <Text color="yellow" bold>
+              允许 {ask.tool}? {ask.summary} (y=放行 / 其他=拒绝)
+            </Text>
+          ) : (
+            <TextInput
+              value={input}
+              focus
+              placeholder={busy ? "运行中…(Esc 中断)" : "输入指令"}
+              onChange={setInput}
+              onSubmit={submit}
+            />
+          )}
+        </Box>
+      )}
+      <Box marginTop={1}>
+        <Text color="gray">Ctrl+o 设置 · /config 设置 · /quit 退出 · /reset 清空</Text>
       </Box>
     </Box>
   )
