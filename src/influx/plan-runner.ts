@@ -41,7 +41,20 @@ export async function runPlannedTask(
   const client = createLLMClient({ endpoint: opts.url ? resolveEndpoint(opts.url) : undefined })
   const spec = await generatePlanSpec(client, task, opts.model)
   opts.onPlan?.(spec)
+  return runSpec(spec, opts)
+}
 
+export interface RunSpecOpts {
+  model?: string
+  url?: string
+  onEvent?: (e: RuntimeEvent) => void
+  ask?: (req: { tool: string; summary: string }) => Promise<boolean>
+  cwd?: string
+  vfs?: import("../vfs.ts").VFS
+}
+
+/** 给定 spec 直接执行(不再生成) —— 供双引擎自动分流复用 */
+export async function runSpec(spec: unknown, opts: RunSpecOpts = {}): Promise<PlanRunResult> {
   const rt = new Runtime(getTool)
   const plan = planFromSpec(spec)
   const rep = await rt.run(plan, {
@@ -63,12 +76,24 @@ export async function runPlannedTask(
   }
 }
 
+/** 统计 spec 中可执行的 task 节点数(用于判断是否值得走并行路径) */
+export function countTaskNodes(spec: unknown): number {
+  const walk = (s: any): number => {
+    if (!s) return 0
+    if (Array.isArray(s)) return s.reduce((a, x) => a + walk(x), 0)
+    if (typeof s !== "object") return 0
+    const self = s.type === "task" || typeof s.tool === "string" ? 1 : 0
+    return self + walk(s.children ?? [])
+  }
+  return walk(spec)
+}
+
 /**
  * 让 LLM 把任务描述转成 Influx 计划 spec(JSON)。
  * 要求: 只输出 JSON; 节点是独立的可并行单元; 依赖用 dependsOn 声明;
- * 工具名限制为 influx 内置(详见 system 提示)。
+ * 工具名限制为 influx 内置 + agent.* 桥接(详见 system 提示)。
  */
-async function generatePlanSpec(
+export async function generatePlanSpec(
   client: ReturnType<typeof createLLMClient>,
   task: string,
   model?: string,
@@ -80,9 +105,11 @@ async function generatePlanSpec(
     "- 把任务拆成 3-8 个可独立执行的节点; 无依赖的节点不要互相 dependsOn(它们会全并行执行)",
     "- 只有真实数据依赖才用 dependsOn(如: 先读文件再基于内容写文件)",
     "- 可用工具: shell(执行命令, params:{cmd}), read-file(params:{path}), write-file(params:{path,content}),",
-    "  list-dir(params:{path}), http.get(params:{url}), http.post(params:{url,body}), llm(params:{prompt})",
+    "  list-dir(params:{path}), http.get(params:{url}), http.post(params:{url,body}), llm(params:{prompt}),",
+    "  agent.read(params:{path}), agent.bash(params:{cmd}), agent.glob(params:{pattern}), agent.grep(params:{pattern,path})",
     "- write-file 的 content 可引用前序结果: {$k1.answer} 或 {$k1.content}",
     "- 每个 key 唯一, 用 2-4 个小写字母数字",
+    "- 若任务不适合拆解(纯问答/闲聊), 输出 { type:'task', key:'a1', tool:'llm', params:{prompt:'<原样转发>'}, children:[] }",
     "- 输出合法 JSON, 不要 markdown 代码块",
   ].join("\n")
 

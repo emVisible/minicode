@@ -15,6 +15,7 @@ import { saveConfig, applyConfigToEnv, configPath } from "../config.ts"
 import { SettingsPanel } from "./settings.tsx"
 import { TaskTree, upsertWave, updateTool, markWave } from "./tree.tsx"
 import { renderMarkdown } from "./markdown.tsx"
+import { WelcomeCard } from "./welcome.tsx"
 import type { MinicodeConfig } from "../config.ts"
 import type { ChatMessage, LoopEvent, TaskNode, ToolDef } from "../types.ts"
 
@@ -300,6 +301,152 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
     setStep(0)
   }
 
+  /**
+   * 双引擎自动分流: 消息进来先尝试拆解为 Influx DAG(1 次快速 LLM 调用)。
+   *  ≥2 个可并行节点 → 走 Influx 全并行(波次调度, 跨波次并行);
+   *  拆解失败/单节点(纯问答) → 回退 runAgent 普通对话。
+   *  这样默认路径就吃上 Influx 的并行能力, 而不是只靠 /plan 手动触发。
+   */
+  async function runDual(prompt: string): Promise<void> {
+    setBusy(true)
+    runningToolsRef.current = 0
+    setRunningTools(0)
+    spinnerTimerRef.current = setInterval(() => setSpinner((s) => (s + 1) % 4), 120)
+    const root: TaskNode = { id: `run_${Date.now()}`, label: prompt, status: "done", children: [] }
+    treeRef.current = root
+    setTree({ ...root })
+    setTreePrompt(prompt)
+    appendLine({ kind: "user", text: prompt })
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const { VFS } = await import("../vfs.ts")
+    const vfs = new VFS(cwd)
+
+    try {
+      // ① 尝试拆解 DAG(1 次 LLM 调用, 低温度, 快速失败)
+      const { generatePlanSpec, countTaskNodes, runSpec } = await import("../influx/plan-runner.ts")
+      let spec: unknown
+      try {
+        spec = await generatePlanSpec(client, prompt)
+      } catch {
+        spec = undefined
+      }
+      const nodes = spec ? countTaskNodes(spec) : 0
+
+      if (nodes >= 2) {
+        // ② Influx 全并行: 波次事件桥接任务树, 写操作进 VFS(VBuild)
+        appendLine({ kind: "tool-start", text: `⚡ 拆解为 ${nodes} 个并行任务, Influx 全并行执行` })
+        let curWave = 0
+        await runSpec(spec, {
+          cwd,
+          ask: queueAsk,
+          vfs,
+          onEvent: (e) => {
+            switch (e.type) {
+              case "wave-start": {
+                curWave = e.n
+                if (treeRef.current) {
+                  upsertWave(treeRef.current, { n: e.n, parallel: e.parallel, calls: [] })
+                  bumpTree()
+                }
+                break
+              }
+              case "node-start": {
+                if (treeRef.current) {
+                  upsertWave(treeRef.current, { n: curWave, parallel: true, calls: [] })
+                  const wave = treeRef.current.children.find((c) => c.id === `wave_${curWave}`)
+                  if (wave && !wave.children.some((c) => c.id === e.key)) {
+                    wave.children.push({ id: e.key, label: e.tool, status: "running", children: [] })
+                  }
+                  bumpTree()
+                }
+                break
+              }
+              case "node-end": {
+                if (treeRef.current) {
+                  const wave = treeRef.current.children.find((c) => c.id === `wave_${curWave}`)
+                  const node = wave?.children.find((c) => c.id === e.key)
+                  if (node) {
+                    node.status = e.error ? "error" : "done"
+                    node.ms = e.ms
+                    if (e.error) node.error = e.error
+                  }
+                  if (wave && wave.children.length && wave.children.every((c) => c.status !== "running")) {
+                    wave.status = "done"
+                  }
+                  bumpTree()
+                }
+                break
+              }
+              case "wave-end": {
+                if (treeRef.current) {
+                  const wave = treeRef.current.children.find((c) => c.id === `wave_${curWave}`)
+                  if (wave) wave.status = "done"
+                  bumpTree()
+                }
+                break
+              }
+            }
+          },
+        })
+        if (vfs.hasChanges()) {
+          for (const c of vfs.diff()) {
+            appendLine({
+              kind: "tool-result",
+              text: `  ${c.kind === "create" ? "+" : c.kind === "delete" ? "−" : "~"} ${c.path} (${c.bytes}B)`,
+            })
+          }
+          pendingVfsRef.current = vfs
+          appendLine({
+            kind: "assistant",
+            text: "RBuild 确认: 输入 y 落盘(并行写入), 输入 n 丢弃虚拟改动",
+          })
+        }
+      } else {
+        // ③ 回退: 普通对话(纯问答/拆解失败)
+        if (spec) appendLine({ kind: "tool-result", text: "简单任务, 直接对话执行" })
+        const result = await runAgent({
+          history: historyRef.current,
+          userMessage: { role: "user", content: prompt },
+          tools,
+          system,
+          cwd,
+          maxSteps: 30,
+          signal: controller.signal,
+          requests: (opts) => client.stream(opts),
+          ask: queueAsk,
+          onEvent: handleEvent,
+        })
+        historyRef.current = result.messages
+        if (result.finish === "doom_loop") appendLine({ kind: "error", text: "死循环保护: 已中止同参数重复调用" })
+        else if (result.finish === "aborted") appendLine({ kind: "error", text: "已中断" })
+        else if (result.finish === "max_steps") appendLine({ kind: "error", text: `已达 ${result.steps} 步上限, 未完成` })
+        else if (result.steps > 1) appendLine({ kind: "tool-result", text: `✓ 完成: ${result.steps} 轮工具回环` })
+      }
+    } catch (e) {
+      appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
+    }
+    commitStream()
+    const c = cpsRef.current
+    c.chars = 0
+    c.last = performance.now()
+    setCps(0)
+    for (const pending of askQueueRef.current) pending.resolve(false)
+    askQueueRef.current = []
+    setAsk(null)
+    if (spinnerTimerRef.current) {
+      clearInterval(spinnerTimerRef.current)
+      spinnerTimerRef.current = null
+    }
+    if (treeRef.current && treeRef.current.children.length === 0) {
+      treeRef.current = null
+      setTree(null)
+    }
+    controllerRef.current = null
+    setBusy(false)
+    setStep(0)
+  }
+
   /** /plan: 让 LLM 生成 DAG 计划, 交给 Influx 全并行执行(跨波次全并行) */
   async function runPlan(task: string): Promise<void> {
     setBusy(true)
@@ -536,7 +683,7 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
       return
     }
     setInput("")
-    void run(trimmed)
+    void runDual(trimmed)
   }
 
   useInput((_input, key) => {
@@ -564,17 +711,19 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   })
 
   useEffect(() => {
-    appendLine({
-      kind: "assistant",
-      text: `MiniCode · ${cwd} · ${process.env.LLM_MODEL ?? "默认"} · Ctrl+o 设置 / /quit 退出`,
-    })
     return () => {
       if (spinnerTimerRef.current) clearInterval(spinnerTimerRef.current)
     }
-  }, [cwd])
+  }, [])
+
+  const modelName = process.env.LLM_MODEL ?? "默认"
 
   return (
     <Box flexDirection="column" width="100%">
+      {/* 启动欢迎卡片(首个消息前显示) */}
+      {lines.length === 0 && (
+        <WelcomeCard cwd={cwd} model={modelName} toolCount={tools.length} />
+      )}
       {/* 组合式布局: 上部 = 对话流 + 树侧边栏; 下部 = 输入行 */}
       <Box flexDirection="row" width="100%">
         <Box flexDirection="column" alignItems="flex-start" flexGrow={1} width="50%">
