@@ -168,6 +168,27 @@ const scenario4: Scenario = {
   finalText: (msgs) => `结论: ${(msgs.at(-1) as ChatMessage).content}`,
 }
 
+// ---------- 场景 5: 并行工具调用 ----------
+// 一次返回 2 个 sleep 1 的 bash 调用: 并行应 ~1s, 串行会 ~2s
+
+const scenario5: Scenario = {
+  name: "并行工具",
+  toolCalls: (msgs) => {
+    const user = msgs.find((m) => m.role === "user")?.content ?? ""
+    if (user.includes("并行")) {
+      return [
+        { name: "bash", args: JSON.stringify({ cmd: "sleep 1" }) },
+        { name: "bash", args: JSON.stringify({ cmd: "sleep 1" }) },
+      ]
+    }
+    return undefined
+  },
+  finalText: (msgs) => {
+    const toolMsgs = msgs.filter((m) => m.role === "tool")
+    return `完成, ${toolMsgs.length} 条回执`
+  },
+}
+
 async function main(): Promise<void> {
   console.log("MiniCode smoke")
 
@@ -252,6 +273,17 @@ async function main(): Promise<void> {
       result.messages.some((m) => m.role === "tool" && m.content.includes("用户拒绝")),
       JSON.stringify(result.messages.filter((m) => m.role === "tool")),
     )
+  }
+
+  // 场景 5: 一次 2 个 sleep 1 的 bash 调用 → 并行执行(耗时 ~1s 而非 ~2s)
+  {
+    const s = await runScenario(scenario5, "并行执行两个 sleep")
+    const t0 = performance.now()
+    const result = await s.run()
+    const elapsed = performance.now() - t0
+    const toolCount = result.messages.filter((m) => m.role === "tool").length
+    check("并行: 2 条工具回执", toolCount === 2, `count=${toolCount}`)
+    check(`并行: 耗时 ${(elapsed / 1000).toFixed(2)}s < 1.8s`, elapsed < 1800, `elapsed=${(elapsed / 1000).toFixed(2)}s`)
   }
 
   console.log(`\n${passed} passed, ${failed} failed`)

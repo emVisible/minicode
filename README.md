@@ -14,12 +14,14 @@ Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式
 ### 对话 agent
 
 - **LLM 流式客户端**(`src/llm.ts`): SSE 解析 `content`/`tool_calls` delta,超时/退避重试/AbortSignal 中断,API 兼容 OpenAI Chat Completions
-- **Agent 循环**(`src/loop.ts`): 请求 → 解析 tool-call → **并行执行** → 回喂结果 → 重发,直到模型不再调用工具;dead-loop 保护(同工具同参数 ≥3 次中止);最多 30 轮
+- **Agent 循环**(`src/loop.ts`): 请求 → 解析 tool-call → **并行执行**(同一回复内的多个独立工具调用同时运行) → 回喂结果 → 重发,直到模型不再调用工具;dead-loop 保护(同工具同参数 ≥3 次中止);最多 30 轮
+  - 系统提示词明确引导模型一次发出多个无依赖的工具调用;TUI 状态栏实时显示 `⚡并行×N`
+  - 验证: smoke 场景 5 断言 2 个 sleep 1 并行完成(1.02s, 串行为 2s)
 - **上下文压缩**: 单次请求体积超 128KB 时丢弃最旧消息并注入截断标记(摘要化压缩见路线图 W2)
 - **内置工具**(`src/tools.ts`): `read` / `write` / `edit` / `glob` / `grep` / `bash` / `http_get` / `http_post` / `llm`
   - 读类( read / glob / grep / http_get / http_post )默认放行;写类(write / edit)与命令(bash)触发确认(并行多工具时逐个排队确认)
   - 输出截断( read 50KB / bash 4000 字符 / grep 200 条 )
-- **界面**: 交互式 Ink TUI(输入框、流式文本渲染、工具调用状态、权限确认队列、Esc 中断),以及 headless 模式(管道/stdin 单轮,TTY 下可交互确认)
+- **界面**: 交互式 Ink TUI(输入框、流式文本渲染[30ms 批量节流, 长会话不卡顿]、工具调用状态、权限确认队列、Esc 中断),以及 headless 模式(管道/stdin 单轮,TTY 下可交互确认)
   - **内置设置面板**: TUI 内 `Ctrl+o`(或 `/config`)呼出,配置 LLM URL / API Key / Model,Enter 保存即生效并持久化到 `~/.minicode/config.json`(0600 权限,原子写);环境变量优先于配置文件
 - **终结条件**: stop(完成) / aborted(用户中断) / max_steps / doom_loop
 

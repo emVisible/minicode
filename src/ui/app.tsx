@@ -41,6 +41,13 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   const historyRef = useRef<ChatMessage[]>([])
   const controllerRef = useRef<AbortController | null>(null)
   const askQueueRef = useRef<Array<{ req: { tool: string; summary: string }; resolve: (v: boolean) => void }>>([])
+  /** 流式文本节流: SSE delta 频繁到来, 批量合并后按帧渲染, 避免每 chunk 一次全量 setState */
+  const streamBufRef = useRef("")
+  const streamTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const STREAM_FLUSH_MS = 30
+  /** 并行工具计数: 显示当前同时在跑的工具数, 让并发可视化 */
+  const runningToolsRef = useRef(0)
+  const [runningTools, setRunningTools] = useState(0)
 
   /** 同步更新 lines state + ref, 避免流式回调闭包读到过期数组 */
   function syncLines(updater: (prev: Line[]) => Line[]): void {
@@ -53,6 +60,26 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
 
   function appendLine(line: Line): void {
     syncLines((prev) => [...prev, line])
+  }
+
+  /** 把节流缓冲的流式文本一次性提交到状态并渲染 */
+  function flushStream(): void {
+    if (streamTimerRef.current) {
+      clearTimeout(streamTimerRef.current)
+      streamTimerRef.current = null
+    }
+    const text = streamBufRef.current
+    if (!text) return
+    streamBufRef.current = ""
+    syncLines((prev) => {
+      const last = prev.at(-1)
+      if (last && last.kind === "assistant" && last.stream) {
+        const next = [...prev]
+        next[next.length - 1] = { ...last, text: last.text + text }
+        return next
+      }
+      return [...prev, { kind: "assistant", text, stream: true }]
+    })
   }
 
   /** 权限确认队列: 并行工具调用可能同时触发多个 ask, 逐个展示 */
@@ -107,33 +134,39 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
   function handleEvent(e: LoopEvent): void {
     switch (e.type) {
       case "step":
+        flushStream()
         setStep(e.n)
         return
       case "text": {
-        syncLines((prev) => {
-          const last = prev.at(-1)
-          if (last && last.kind === "assistant" && last.stream) {
-            const next = [...prev]
-            next[next.length - 1] = { ...last, text: last.text + e.text }
-            return next
-          }
-          return [...prev, { kind: "assistant", text: e.text, stream: true }]
-        })
+        // 只累积到缓冲区, 由定时器批量提交, 防止高频 setState
+        streamBufRef.current += e.text
+        if (!streamTimerRef.current) {
+          streamTimerRef.current = setTimeout(flushStream, STREAM_FLUSH_MS)
+        }
         return
       }
       case "tool-start":
+        flushStream()
+        runningToolsRef.current++
+        setRunningTools(runningToolsRef.current)
         appendLine({ kind: "tool-start", text: `${e.tool} ${JSON.stringify(e.args).slice(0, 200)}` })
         return
       case "tool-result":
+        flushStream()
+        runningToolsRef.current = Math.max(0, runningToolsRef.current - 1)
+        setRunningTools(runningToolsRef.current)
         appendLine({ kind: "tool-result", text: e.error ? `✗ ${e.tool}: ${e.error}` : `✓ ${e.tool}` })
         return
       case "done":
+        flushStream()
         return
     }
   }
 
   async function run(prompt: string): Promise<void> {
     setBusy(true)
+    runningToolsRef.current = 0
+    setRunningTools(0)
     appendLine({ kind: "user", text: prompt })
     const controller = new AbortController()
     controllerRef.current = controller
@@ -155,9 +188,11 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
       if (result.finish === "doom_loop") appendLine({ kind: "error", text: "死循环保护: 已中止同参数重复调用" })
       else if (result.finish === "aborted") appendLine({ kind: "error", text: "已中断" })
       else if (result.finish === "max_steps") appendLine({ kind: "error", text: `已达 ${result.steps} 步上限, 未完成` })
+      else if (result.steps > 1) appendLine({ kind: "tool-result", text: `✓ 完成: ${result.steps} 轮工具回环` })
     } catch (e) {
       appendLine({ kind: "error", text: e instanceof Error ? e.message : String(e) })
     }
+    flushStream()
     // 清空未决的权限确认(中断/异常时不能让 Promise 悬空)
     for (const pending of askQueueRef.current) pending.resolve(false)
     askQueueRef.current = []
@@ -247,7 +282,9 @@ export default function App({ cwd }: { cwd: string }): ReactNode {
         />
       ) : (
         <Box marginTop={1} flexDirection="row">
-          <Text color="gray">{busy ? `[${step}]` : ">"} </Text>
+          <Text color="gray">
+            {busy ? (runningTools > 1 ? `[${step}] ⚡并行×${runningTools}` : `[${step}]`) : ">"}{" "}
+          </Text>
           {ask ? (
             <Text color="yellow" bold>
               允许 {ask.tool}? {ask.summary} (y=放行 / 其他=拒绝)
