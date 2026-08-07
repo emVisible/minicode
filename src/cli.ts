@@ -14,6 +14,7 @@ import { createLLMClient } from "./llm.ts"
 import { runAgent } from "./loop.ts"
 import { buildSystemPrompt } from "./prompt.ts"
 import { loadConfig, applyConfigToEnv } from "./config.ts"
+import { log, installCrashHandlers, logSessionStart, logSessionEnd } from "./log.ts"
 import { parsePlanFlags, planUsage, runPlanFile, benchPlanFile, viewPlanFile } from "./influx/plan-cli.ts"
 import type { PlanCliFlags } from "./influx/plan-cli.ts"
 
@@ -22,15 +23,18 @@ interface CliFlags {
   yes: boolean
   model?: string
   cwd: string
+  /** 启动时恢复最近一次会话 */
+  resume: boolean
 }
 
 function parseArgs(argv: string[]): { flags: CliFlags; promptArgs: string[] } {
-  const flags: CliFlags = { headless: false, yes: false, cwd: process.cwd() }
+  const flags: CliFlags = { headless: false, yes: false, cwd: process.cwd(), resume: false }
   const promptArgs: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!
     if (arg === "--headless") flags.headless = true
     else if (arg === "--yes") flags.yes = true
+    else if (arg === "-r" || arg === "--resume") flags.resume = true
     else if (arg === "--cwd") {
       const next = argv[i + 1]
       if (next !== undefined && !next.startsWith("--")) {
@@ -93,6 +97,7 @@ async function planSubcommand(cmd: "run" | "bench" | "view", file: string, flagA
     else if (cmd === "bench") await benchPlanFile(file, flags)
     else await viewPlanFile(file, flags)
   } catch (e) {
+    log.error("plan", `${cmd} 失败`, { file, message: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? e.stack : undefined })
     console.error(`✗ ${e instanceof Error ? e.message : String(e)}`)
     process.exit(1)
   }
@@ -162,6 +167,15 @@ async function runAgentOnce(flags: CliFlags, rawPrompt: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // 日志体系: 崩溃兜底 + 会话生命周期记录
+  installCrashHandlers()
+  logSessionStart(process.argv.slice(2), process.cwd())
+  const exitCode = await runMain()
+  logSessionEnd(exitCode)
+  process.exit(exitCode)
+}
+
+async function runMain(): Promise<number> {
   // 启动即加载用户配置: 填充未设置的环境变量(环境变量优先)
   applyConfigToEnv(loadConfig())
   const argv = process.argv.slice(2)
@@ -169,17 +183,18 @@ async function main(): Promise<void> {
   // 子命令分发: plan / run / bench / view / mcp
   if (argv[0] === "mcp") {
     await import("./influx/mcp.ts")
-    return
+    return 0
   }
   if (argv[0] === "plan" || argv[0] === "run" || argv[0] === "bench" || argv[0] === "view") {
     await dispatchPlan(argv)
-    return
+    return 0
   }
 
   const { flags, promptArgs } = parseArgs(argv)
 
   // 交互模式(默认): 启动 Ink TUI(启动前检测终端主题, 注入 App)
   if (!flags.headless) {
+    log.info("tui", "启动全屏 TUI")
     const { render } = await import("ink")
     const { default: App } = await import("./ui/app.tsx")
     const { createElement } = await import("react")
@@ -197,22 +212,26 @@ async function main(): Promise<void> {
       process.stdout.write("\x1b[?1049l\x1b[?25h")
     }
     process.on("exit", restore)
-    const instance = render(createElement(App, { cwd: flags.cwd, theme: theme ?? undefined }))
+    const instance = render(createElement(App, { cwd: flags.cwd, theme: theme ?? undefined, resume: flags.resume }))
     await instance.waitUntilExit()
     restore()
-    return
+    log.info("tui", "TUI 退出")
+    return 0
   }
 
   const rawPrompt = promptArgs.join(" ") || (process.stdin.isTTY ? "" : await readStdin())
   if (!rawPrompt) {
     console.error("未提供 prompt(可以用管道: echo '...' | minicode --headless)")
-    process.exit(1)
+    return 1
   }
 
+  log.info("headless", "启动", { prompt: rawPrompt.slice(0, 200) })
   await runAgentOnce(flags, rawPrompt)
+  return 0
 }
 
 main().catch((e) => {
+  log.error("main", "致命错误", { message: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? e.stack : undefined })
   console.error(`\n✗ ${e instanceof Error ? e.message : String(e)}`)
   process.exit(1)
 })

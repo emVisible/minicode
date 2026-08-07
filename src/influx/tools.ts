@@ -2,8 +2,6 @@
 // 内置: http.get / http.post / shell / write-file / read-file / list-dir / llm
 // 自定义工具: 计划文件通过 registerTool 注册, MCP 会话与 spec 计划同样可用
 
-import { exec as execCb } from "node:child_process"
-import { promisify } from "node:util"
 import { Agent, request as uRequest } from "undici"
 import { resolve } from "node:path"
 import type { ToolCtx } from "./core.ts"
@@ -34,8 +32,9 @@ export function listTools(): Array<{ name: string; desc?: string }> {
 
 registerTool(
   "http.get",
-  async ({ url, headers, timeoutMs = 30000 }, ctx) => {
-    if (!url) throw new Error("[http.get] 缺少 url")
+  async (params, ctx) => {
+    const { url, headers, timeoutMs = 30000 } = params
+    if (!url) throw new Error(`[http.get] 缺少 url (节点 ${ctx.key}, 参数: ${truncate(JSON.stringify(params), 200)})`)
     return request("GET", { url, headers, timeoutMs }, ctx.signal)
   },
   "GET 远端 API, 参数: url(必填), headers, timeoutMs; 返回 {status, headers, body}",
@@ -43,8 +42,9 @@ registerTool(
 
 registerTool(
   "http.post",
-  async ({ url, headers, body, timeoutMs = 30000 }, ctx) => {
-    if (!url) throw new Error("[http.post] 缺少 url")
+  async (params, ctx) => {
+    const { url, headers, body, timeoutMs = 30000 } = params
+    if (!url) throw new Error(`[http.post] 缺少 url (节点 ${ctx.key}, 参数: ${truncate(JSON.stringify(params), 200)})`)
     return request("POST", { url, headers, body, timeoutMs }, ctx.signal)
   },
   "POST 远端 API, 参数: url(必填), headers, body, timeoutMs; 返回 {status, headers, body}",
@@ -77,20 +77,41 @@ async function request(
 
 // ---------- 本地 shell ----------
 
-const exec = promisify(execCb)
+import { runCommandStreaming, runCommandError } from "../exec-stream.ts"
 
 registerTool(
   "shell",
-  async ({ cmd, timeoutMs = 30000 }, ctx) => {
-    if (!cmd) throw new Error("[shell] 缺少 cmd")
-    const { stdout, stderr } = await exec(cmd, {
-      timeout: timeoutMs,
+  async (params, ctx) => {
+    const cmd = params.cmd
+    if (!cmd) {
+      // 空 cmd 常见根因: 模型写了 {$k.output} 模板引用, 但引用的 key 不存在/输出为空 → 解析成空串。
+      // 用原始参数回看模板, 直接告诉用户问题出在哪。
+      const raw = ctx.rawParams?.cmd
+      const templateRef = typeof raw === "string" && raw.includes("{$") ? raw : undefined
+      throw new Error(
+        templateRef
+          ? `[shell] cmd 解析为空 (节点 ${ctx.key}): 模板 "${templateRef.slice(0, 120)}" 引用的节点输出为空或 key 不存在`
+          : `[shell] 缺少 cmd (节点 ${ctx.key}, 收到参数: ${truncate(JSON.stringify(params), 200)})`,
+      )
+    }
+    const timeoutMs = params.timeoutMs ?? 30000
+    // VBuild 模式: shell 读真实磁盘, 先把暂存的创建/修改刷到磁盘(如 bash fix.sh 依赖前序 write-file)
+    ctx.vfs?.flushToDisk()
+    // 流式执行: stdout/stderr 逐 chunk 实时转发给 UI —— 长命令不再"零信息运行"
+    const key = ctx.key ?? "shell"
+    const r = await runCommandStreaming({
+      cmd,
       cwd: ctx.cwd,
-      maxBuffer: 10 * 1024 * 1024,
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      timeoutMs,
+      signal: ctx.signal,
+      onChunk: (text) => {
+        // 限流: 每 chunk ≤ 500 字符, 防止高频输出把 UI 刷爆
+        ctx.onStream?.(key, text.length > 500 ? text.slice(-500) + "\n…" : text)
+      },
     })
-    const out = stdout.trim()
-    return { stdout: out, stderr: stderr.trim(), exitCode: 0, output: out }
+    if (r.code !== 0) throw runCommandError(r, cmd)
+    const out = r.stdout.trim()
+    return { stdout: out, stderr: r.stderr.trim(), exitCode: 0, output: out }
   },
   "执行本地 shell 命令, 参数: cmd(必填), timeoutMs; 返回 {stdout, stderr, exitCode, output}",
 )
@@ -99,10 +120,11 @@ registerTool(
 
 registerTool(
   "write-file",
-  async ({ path, content = "", append = false }, ctx) => {
+  async (params, ctx) => {
     const { mkdirSync, writeFileSync, appendFileSync, statSync } = await import("node:fs")
     const { dirname } = await import("node:path")
-    if (!path) throw new Error("[write-file] 缺少 path")
+    const { path, content = "", append = false } = params
+    if (!path) throw new Error(`[write-file] 缺少 path (节点 ${ctx.key}, 参数: ${truncate(JSON.stringify(params), 200)})`)
     // VBuild 模式: 写入内存 overlay, RBuild 统一落盘
     if (ctx.vfs) {
       const abs = ctx.vfs.abs(path)
@@ -132,9 +154,10 @@ function resolvePath(cwd: string, p: string): string {
 
 registerTool(
   "read-file",
-  async ({ path }, ctx) => {
+  async (params, ctx) => {
     const { readFileSync, existsSync, statSync } = await import("node:fs")
-    if (!path) throw new Error("[read-file] 缺少 path")
+    const { path } = params
+    if (!path) throw new Error(`[read-file] 缺少 path (节点 ${ctx.key}, 参数: ${truncate(JSON.stringify(params), 200)})`)
     // VBuild 模式: 优先读 overlay(构建中的世界)
     if (ctx.vfs) {
       const abs = ctx.vfs.abs(path)
@@ -168,10 +191,11 @@ function truncateFile(content: string, path: string): string {
 
 registerTool(
   "list-dir",
-  async ({ path, recursive = false }, ctx) => {
+  async (params, ctx) => {
     const { readdirSync } = await import("node:fs")
     const { join } = await import("node:path")
-    if (!path) throw new Error("[list-dir] 缺少 path")
+    const { path, recursive = false } = params
+    if (!path) throw new Error(`[list-dir] 缺少 path (节点 ${ctx.key}, 参数: ${truncate(JSON.stringify(params), 200)})`)
     const root = resolvePath(ctx.cwd, path)
     const files: string[] = []
     const dirs: string[] = []
@@ -220,8 +244,9 @@ async function getAgentLoop() {
 
 registerTool(
   "llm",
-  async ({ prompt, system, model, temperature = 0.2, url, timeoutMs = 120000, tools, maxSteps }, ctx) => {
-    if (!prompt) throw new Error("[llm] 缺少 prompt")
+  async (params, ctx) => {
+    const { prompt, system, model, temperature = 0.2, url, timeoutMs = 120000, tools, maxSteps } = params
+    if (!prompt) throw new Error(`[llm] 缺少 prompt (节点 ${ctx.key}, 参数: ${truncate(JSON.stringify(params), 200)})`)
     const client = createLLMClient({ endpoint: url ? resolveEndpoint(url) : undefined, timeoutMs })
 
     // agent 模式: 计划节点内嵌完整 agent 循环(tool_calls)

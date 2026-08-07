@@ -4,6 +4,11 @@
 
 import { createHash } from "node:crypto"
 import { resolve as resolvePath } from "node:path"
+import { cpus } from "node:os"
+import { log } from "../log.ts"
+
+/** 默认并发上限: 利用一切可用硬件资源, 但避免 shell/LLM 争抢打满 */
+export const DEFAULT_MAX_CONCURRENT = Math.max(1, Math.min(8, cpus().length))
 
 export interface Element {
   type: unknown
@@ -52,7 +57,7 @@ export function planFromSpec(spec: any): unknown {
       },
     }
   }
-  return { type: Flow, props: { key: spec.key, dependsOn: spec.dependsOn, children } }
+  return { type: Flow, props: { key: spec.key, dependsOn: spec.dependsOn, output: spec.output, children } }
 }
 
 export type ToolRun = (params: Record<string, any>, ctx: ToolCtx) => Promise<unknown>
@@ -82,6 +87,8 @@ export interface ToolCtx {
   onStream?: (key: string, text: string) => void
   /** 当前执行节点的 key(用于 llm 节点区分多个节点的流式输出) */
   key?: string
+  /** 解析前的原始参数(模板 {$k.output} 未展开)。工具报错时可回看模型原始意图 */
+  rawParams?: Record<string, any>
   /** 用户中断信号(Esc); 工具执行时合并到自身超时 */
   signal?: AbortSignal
   /** 预取缓存(预测式执行): read-file 命中后跳过磁盘 IO; 运行时预热下一前沿 */
@@ -108,6 +115,9 @@ export interface Fiber {
   status: FiberStatus
   alt: Fiber | null
   ms: number
+  /** Flow 的聚合输出模板(递归拆解: 子节点全部完成后, 解析引用并提交为父节点输出) */
+  aggregate?: string
+  aggregateCommitted?: boolean
 }
 
 export interface WaveNode {
@@ -163,6 +173,8 @@ export type RuntimeEvent =
 export interface RuntimeOptions {
   serial?: boolean
   maxIter?: number
+  /** 全局并发上限(同时执行的节点数); 默认 min(8, CPU 核数) */
+  maxConcurrent?: number
   onEvent?: (e: RuntimeEvent) => void
   cwd?: string
   ask?: (req: { tool: string; summary: string }) => Promise<boolean>
@@ -197,7 +209,7 @@ export class Runtime {
   }
 
   async run(plan: unknown, opts: RuntimeOptions = {}): Promise<RunReport> {
-    const { serial = false, maxIter = 8, onEvent, cwd = process.cwd(), ask = async () => true, vfs, signal, prefetch } = opts
+    const { serial = false, maxIter = 8, maxConcurrent = DEFAULT_MAX_CONCURRENT, onEvent, cwd = process.cwd(), ask = async () => true, vfs, signal, prefetch } = opts
     this.waves = []
     this.stats = { placed: 0, updated: 0, skipped: 0, blocked: 0, errors: 0 }
     this.lastCached = []
@@ -220,6 +232,7 @@ export class Runtime {
     // 静态计划(非函数)一次 render 即可收敛; 函数计划随状态重渲染直到稳定
     const maxLoop = typeof plan === "function" ? maxIter : 1
 
+    log.info("influx", "计划执行开始", { plan: typeof plan === "function" ? "function" : "static", maxLoop })
     for (let i = 0; i < maxLoop; i++) {
       if (signal?.aborted) throw new Error("[influx] 计划执行已中断(用户取消)")
       onEvent?.({ type: "iter", n: i + 1 })
@@ -230,14 +243,23 @@ export class Runtime {
       const changed = this.reconcile(fibers)
       if (!changed) break
       onEvent?.({ type: "reconcile", stats: { ...this.stats } })
-      await this.runWaves(fibers, serial, ctx, onEvent)
+      await this.runWaves(fibers, serial, ctx, onEvent, maxConcurrent)
       for (const f of fibers) {
         if (!this.fiberInfo.has(f.key)) {
           this.fiberInfo.set(f.key, { status: f.status, ms: f.ms, executed: f.executed })
         }
       }
     }
+    this.logRunSummary()
     return { waves: this.waves, stats: this.stats, cached: this.lastCached, blocked: this.blocked }
+  }
+
+  private logRunSummary(): void {
+    log.info("influx", "计划执行结束", {
+      waves: this.waves.length,
+      stats: this.stats,
+      blockedKeys: Object.keys(this.blocked),
+    })
   }
 
   // 干跑预览: 不执行任何工具, 用与 run 相同的完整判定(含依赖传播)输出影响面
@@ -346,13 +368,48 @@ export class Runtime {
     serial: boolean,
     ctx: ToolCtx,
     onEvent?: (e: RuntimeEvent) => void,
+    maxConcurrent: number = DEFAULT_MAX_CONCURRENT,
   ): Promise<void> {
+    // 事件驱动就绪队列(取代波次屏障):
+    // 任一节点完成 → 立即重算依赖, 新就绪的下游立刻入池, 不等待"同波兄弟"。
+    // "波次"退化为纯展示分组: 池从空到满的连续忙碌期记为一波, wave-end 在池排空时触发。
+    // 全局并发上限 maxConcurrent(默认 min(8, CPU 核)), 防止 shell/LLM 争抢打满。
+    const cap = serial ? 1 : Math.max(1, maxConcurrent)
+    const running = new Map<Fiber, Promise<void>>()
+    let wave: WaveInfo | null = null
+    let waveT0 = 0
+
+    const startWave = (): void => {
+      if (wave) return
+      wave = { n: this.waves.length + 1, parallel: !serial, nodes: [], ms: 0 }
+      waveT0 = performance.now()
+      onEvent?.({ type: "wave-start", n: wave.n, parallel: !serial })
+    }
+    const endWave = (): void => {
+      if (!wave) return
+      wave.ms = performance.now() - waveT0
+      onEvent?.({ type: "wave-end", n: wave.n, ms: wave.ms })
+      this.waves.push(wave)
+      wave = null
+    }
+    const track = (f: Fiber, p: Promise<void>): void => {
+      running.set(f, p)
+      void p.finally(() => {
+        if (running.get(f) === p) running.delete(f)
+      })
+    }
+
+    const emitBlockedNow = (f: Fiber): void => {
+      startWave()
+      onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: "blocked" })
+      onEvent?.({ type: "node-end", key: f.key, tool: f.tool, status: "blocked", ms: 0, error: String(f.error) })
+      wave?.nodes.push({ key: f.key, tool: f.tool, ms: 0, status: "blocked", error: String(f.error) })
+    }
+
     while (true) {
       if (ctx.signal?.aborted) throw new Error("[influx] 计划执行已中断(用户取消)")
       // 阻断传播(递归): 依赖失败/被阻断 -> blocked; 父节点 blocked -> 子节点也 blocked
-      // 被阻断节点也发 node-start/node-end 事件, 让 UI 能看到"谁被阻断、为什么"
       const blockedKeys = new Set<string>()
-      const blockedFibers: Fiber[] = []
       let dirty = true
       while (dirty) {
         dirty = false
@@ -370,126 +427,173 @@ export class Runtime {
             this.stats.blocked++
             this.blocked[f.key] = String(f.error)
             blockedKeys.add(f.key)
-            blockedFibers.push(f)
+            emitBlockedNow(f)
             dirty = true
           }
         }
       }
 
-      const ready = fibers.filter((f) => !f.done && this.ready(f))
-      if (ready.length === 0) {
+      // 聚合 Flow 提交: 子树全部完成后, 把 children 输出解析为父节点输出(递归拆解的信息流通关键点)
+      this.commitAggregates(fibers)
+
+      // 新就绪前沿(任一依赖完成的瞬间立即可调度); 排除已在池中运行的节点(防重复调度)
+      const ready = fibers.filter((f) => !f.done && !running.has(f) && this.ready(f))
+      // 预测式预取: 预热"运行中 ∪ 刚就绪"之后会读的输入(后台, 不阻塞)
+      if (ctx.prefetch && (ready.length || running.size)) {
+        const waveKeys = new Set([...ready.map((f) => f.key), ...[...running.keys()].map((f) => f.key)])
+        const reads = this.nextFrontierReads(fibers, waveKeys, ctx.cwd)
+        if (reads.length) ctx.prefetch.warm(reads)
+      }
+
+      // 填池: 只要有空位就启动就绪节点(不设"波内全部完成"的同步点)
+      for (const f of ready) {
+        if (running.size >= cap) break
+        startWave()
+        const nodeCtx: ToolCtx = { ...ctx, key: f.key, rawParams: f.params }
+        track(f, this.runOne(f, nodeCtx, onEvent))
+      }
+
+      if (running.size === 0) {
+        this.commitAggregates(fibers)
+        endWave()
         const undone = fibers.filter((f) => !f.done)
         if (undone.length) {
+          const allBlocked = undone.every((f) => f.status === "blocked")
+          if (allBlocked) {
+            // 全部被阻断(无可执行节点): 用一波事件把阻断原因展示出去
+            for (const f of undone) emitBlockedNow(f)
+            endWave()
+            return
+          }
           throw new Error(`[influx] deadlock: 依赖未满足 ${undone.map((f) => f.key).join(", ")}`)
-        }
-        if (blockedFibers.length) {
-          // 全部被阻断(无可执行节点): 用一波事件把阻断原因展示出去
-          this.emitBlockedWave(blockedFibers, serial, onEvent)
         }
         return
       }
 
-      const wave: WaveInfo = { n: this.waves.length + 1, parallel: !serial, nodes: [], ms: 0 }
-      onEvent?.({ type: "wave-start", n: wave.n, parallel: !serial })
-      // 预测式预取: 预热下一就绪前沿的读输入(后台, 不阻塞本波执行)
-      if (ctx.prefetch) {
-        const waveKeys = new Set(ready.map((f) => f.key))
-        const reads = this.nextFrontierReads(fibers, waveKeys, ctx.cwd)
-        if (reads.length) ctx.prefetch.warm(reads)
-      }
-      const t0 = performance.now()
-      // 被阻断节点并入本波: 与就绪节点同时展示(它们在本轮迭代中被判定阻断)
-      for (const f of blockedFibers) {
-        onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: "blocked" })
-        onEvent?.({ type: "node-end", key: f.key, tool: f.tool, status: "blocked", ms: 0, error: String(f.error) })
-        wave.nodes.push({ key: f.key, tool: f.tool, ms: 0, status: "blocked", error: String(f.error) })
-      }
+      // 等最先完成的节点, 然后立刻回到循环顶部重算就绪 —— 不等待池内其他兄弟
+      await Promise.race([...running.values()])
+    }
+  }
 
-      const runOne = async (f: Fiber) => {
-        // 每节点独立 ctx: 注入节点 key(供 llm 节点流式区分)与中断信号
-        const nodeCtx: ToolCtx = { ...ctx, key: f.key }
-        onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: f.status })
-        const start = performance.now()
-        try {
-          if (f.isHost) {
-            // 参数在节点执行时解析: 此时 dependsOn 的先前波次结果已提交到状态
-            const state = { results: this.results, errors: this.errors }
-            const resolved = resolveRefs(f.params, state)
-            f.fallback = resolveRefs(f.fallback, state)
-            const retries = f.retries ?? 0
-            let lastErr: unknown
-            for (let attempt = 0; attempt <= retries; attempt++) {
-              try {
-                f.result = await this.getTool(f.tool)(resolved, nodeCtx)
-                lastErr = undefined
-                break
-              } catch (e) {
-                lastErr = e
-                if (attempt < retries) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)))
-              }
-            }
-            if (lastErr !== undefined) throw lastErr
+  /** 单节点执行(含重试/结果提交/事件), 永不 reject(错误进 f.error) */
+  private async runOne(f: Fiber, nodeCtx: ToolCtx, onEvent?: (e: RuntimeEvent) => void): Promise<void> {    onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: f.status })
+    const start = performance.now()
+    try {
+      if (f.isHost) {
+        // 参数在节点执行时解析: 此时依赖的先前结果已提交到状态
+        const state = { results: this.results, errors: this.errors }
+        const resolved = resolveRefs(f.params, state)
+        f.fallback = resolveRefs(f.fallback, state)
+        const retries = f.retries ?? 0
+        let lastErr: unknown
+        for (let attempt = 0; attempt <= retries; attempt++) {
+          try {
+            f.result = await this.getTool(f.tool)(resolved, nodeCtx)
+            lastErr = undefined
+            break
+          } catch (e) {
+            lastErr = e
+            if (attempt < retries) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)))
           }
-        } catch (e) {
-          f.error = e
-          this.stats.errors++
         }
-        f.ms = performance.now() - start
-        f.executed = true
-        f.done = true
-        const summary = summarizeResult(f.result, f.tool)
-        onEvent?.({
-          type: "node-end",
-          key: f.key,
-          tool: f.tool,
-          status: f.status,
-          ms: f.ms,
-          error: f.error ? String(f.error) : undefined,
-          summary,
-        })
-        wave.nodes.push({
-          key: f.key,
-          tool: f.tool,
-          ms: f.ms,
-          status: f.status,
-          error: f.error ? String(f.error) : undefined,
-          summary,
-        })
+        if (lastErr !== undefined) throw lastErr
       }
+    } catch (e) {
+      f.error = e
+      this.stats.errors++
+      log.warn("influx", `节点失败 ${f.key}(${f.tool})`, {
+        message: e instanceof Error ? e.message : String(e),
+        ms: performance.now() - start,
+      })
+    }
+    f.ms = performance.now() - start
+    f.executed = true
+    f.done = true
+    // 非宿主(Flow)且带聚合输出: 结果由 commitAggregates 在子树完成后统一提交,
+    // 这里不能写 undefined 到 results, 否则下游 {$parent.output} 会提前解析到空
+    if (!f.isHost && f.aggregate !== undefined) {
+      onEvent?.({ type: "node-end", key: f.key, tool: f.tool, status: f.status, ms: f.ms })
+      return
+    }
+    const summary = summarizeResult(f.result, f.tool)
+    // 统一提交: 成功写 results; 失败且无 fallback 写 errors(阻断下游); 有 fallback 用兜底值继续
+    if (f.error !== undefined) {
+      if (f.fallback !== undefined) this.results[f.key] = f.fallback
+      else this.errors[f.key] = String(f.error)
+    } else {
+      this.results[f.key] = f.result
+    }
+    onEvent?.({
+      type: "node-end",
+      key: f.key,
+      tool: f.tool,
+      status: f.status,
+      ms: f.ms,
+      error: f.error ? String(f.error) : undefined,
+      summary,
+    })
+    const cur = this.waves[this.waves.length - 1]
+    cur?.nodes.push({
+      key: f.key,
+      tool: f.tool,
+      ms: f.ms,
+      status: f.status,
+      error: f.error ? String(f.error) : undefined,
+      summary,
+    })
+  }
 
-      if (serial) {
-        for (const f of ready) await runOne(f)
-      } else {
-        await Promise.all(ready.map(runOne))
-      }
-
-      wave.ms = performance.now() - t0
-      // 统一提交: 成功写 results; 失败且无 fallback 写 errors(阻断下游); 有 fallback 用兜底值继续
-      for (const f of ready) {
-        if (f.error !== undefined) {
-          if (f.fallback !== undefined) this.results[f.key] = f.fallback
-          else this.errors[f.key] = String(f.error)
+  /**
+   * 聚合 Flow 提交(递归拆解的信息流通关键点):
+   * 被拆解的父节点在计划里是 Flow(key 不变), 下游对 {$parent.output} 的引用必须仍然有效。
+   * 子节点全部完成后, 把 aggregate 模板(如 "{$k1a.output}\n{$k1b.output}")解析成父节点输出,
+   * 提交到 results[parentKey] —— 下游依赖与引用无感于"它被拆过"。
+   * 若所有子节点都失败: 把失败信息挂到 errors[parentKey], 让下游按正常阻断传播处理。
+   * 深层嵌套(递归深度 ≥ 2)时子 Flow 的提交可能依赖父 Flow 的后提交 —— 迭代到不动点, 逐层冒泡。
+   */
+  private commitAggregates(fibers: Fiber[]): void {
+    let progress = true
+    while (progress) {
+      progress = false
+      for (const f of fibers) {
+        if (f.isHost || f.aggregate === undefined || f.aggregateCommitted) continue
+        if (!subtreeDone(f)) continue
+        f.aggregateCommitted = true
+        progress = true
+        const desc = descendants(f)
+        const failed = desc.filter((d) => d.error !== undefined || d.status === "blocked")
+        if (desc.length > 0 && failed.length === desc.length) {
+          // 子节点全部失败: 父节点输出不可用, 按错误阻断下游(信息不静默丢失)
+          this.errors[f.key] = `子节点全部失败: ${failed.map((d) => d.key).join(", ")}`
+          log.warn("influx", `聚合 Flow ${f.key} 全部子节点失败`, { keys: failed.map((d) => d.key) })
         } else {
-          this.results[f.key] = f.result
+          const value = resolveRefs(f.aggregate, { results: this.results, errors: this.errors })
+          // 以 { output } 形状提交: 下游 {$parent.output} 引用解析到字符串本身
+          this.results[f.key] = { output: value }
+          log.debug("influx", `聚合 Flow ${f.key} 提交输出`, { chars: String(value ?? "").length })
         }
+        f.done = true
       }
-      onEvent?.({ type: "wave-end", n: wave.n, ms: wave.ms })
-      this.waves.push(wave)
     }
   }
+}
 
-  /** 纯阻断波: 无节点可执行时, 把被阻断节点以事件形式展示(ms=0, 带 error) */
-  private emitBlockedWave(blocked: Fiber[], serial: boolean, onEvent?: (e: RuntimeEvent) => void): void {
-    const wave: WaveInfo = { n: this.waves.length + 1, parallel: !serial, nodes: [], ms: 0 }
-    onEvent?.({ type: "wave-start", n: wave.n, parallel: !serial })
-    for (const f of blocked) {
-      onEvent?.({ type: "node-start", key: f.key, tool: f.tool, status: "blocked" })
-      onEvent?.({ type: "node-end", key: f.key, tool: f.tool, status: "blocked", ms: 0, error: String(f.error) })
-      wave.nodes.push({ key: f.key, tool: f.tool, ms: 0, status: "blocked", error: String(f.error) })
-    }
-    onEvent?.({ type: "wave-end", n: wave.n, ms: 0 })
-    this.waves.push(wave)
+/** 该 fiber 的直接子节点(含嵌套后代) */
+function descendants(f: Fiber): Fiber[] {
+  const out: Fiber[] = []
+  const walk = (c: Fiber | null): void => {
+    if (!c) return
+    out.push(c)
+    walk(c.child)
+    walk(c.sibling)
   }
+  walk(f.child)
+  return out
+}
+
+/** 子树是否全部完成(聚合 Flow 只有子树完成后才提交输出; 嵌套 Flow 需等其自身聚合先提交) */
+function subtreeDone(f: Fiber): boolean {
+  return descendants(f).every((d) => d.done && (d.aggregate === undefined || d.aggregateCommitted))
 }
 
 // ---------- fiber 构建 ----------
@@ -560,6 +664,7 @@ function buildElement(el: unknown, parent: Fiber | null, ctx: { results: Record<
     status: "placement",
     alt: null,
     ms: 0,
+    aggregate: e.props.output,
   }
   const inner = (e.type as any)(e.props)
   f.child = buildElement(inner, f, ctx)

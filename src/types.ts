@@ -40,6 +40,8 @@ export interface ToolRunContext {
   ask: (req: { tool: string; summary: string }) => Promise<boolean>
   /** VBuild 虚拟文件系统: 存在时 write/edit 写入内存 overlay, 由 RBuild 统一落盘 */
   vfs?: import("./vfs.ts").VFS
+  /** 流式工具(bash)实时输出回调; 供并行执行可视化(运行中即见输出) */
+  onStream?: (text: string) => void
 }
 
 export interface ToolOutput {

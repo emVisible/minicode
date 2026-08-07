@@ -37,6 +37,8 @@ export async function ensureAgentTools(): Promise<void> {
           ask: ctx.ask,
           ...(ctx.vfs ? { vfs: ctx.vfs } : {}),
           ...(ctx.signal ? { signal: ctx.signal } : {}),
+          // bash 实时输出桥接: 计划节点运行中即可见命令输出
+          ...(ctx.onStream ? { onStream: (text: string) => ctx.onStream?.(ctx.key ?? name, text) } : {}),
         })
         // 结构化返回: 净化后的正文放 output, 支持 {$k} 与 {$k.output} 两种引用
         return { output: cleanOutput(out.output) }

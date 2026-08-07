@@ -9,6 +9,7 @@ import { Box, Text } from "ink"
 import type { TaskNode } from "../types.ts"
 import { upsertWave, updateTool, markWave } from "./tree.tsx"
 import type { ThemeTokens } from "./theme.ts"
+import { computeWindow, estimateMarkdownHeight } from "./viewport.tsx"
 
 export type ActivityPhase = "idle" | "decompose" | "run" | "plan"
 
@@ -21,10 +22,12 @@ export interface ActivityState {
   planLines: string[]
   /** 当前运行中的工具数 */
   running: number
-  /** 节点 key → 流式输出尾部(展开查看) */
+  /** 节点 key → 流式输出尾部(展开查看/过程 feed) */
   streams: Map<string, string>
   /** 节点 key → 结果摘要 */
   summaries: Map<string, string>
+  /** 波次 n → 开始时间(进度条用) */
+  waveStartAt: Map<number, number>
 }
 
 export interface ActivityAPI {
@@ -52,10 +55,22 @@ export function useActivity(): ActivityAPI {
     running: 0,
     streams: new Map(),
     summaries: new Map(),
+    waveStartAt: new Map(),
   })
+  // 帧级合并渲染: 流式/节点事件高频到达, 全部合并到 16ms 帧内一次重绘。
+  // 这是流式(协程级逐 delta 产出)与渲染(帧)的调和点 —— 一帧一次 setState。
+  const frameRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const schedule = useRef<(fn: () => void) => void>(() => {})
+  schedule.current = (fn: () => void) => {
+    if (frameRef.current) return
+    frameRef.current = setTimeout(() => {
+      frameRef.current = null
+      fn()
+    }, 16)
+  }
   const api = useMemo<ActivityAPI>(() => {
     const st = (): ActivityState => s.current
-    const touch = (): void => force()
+    const touch = (): void => schedule.current(() => force())
     return {
       get state() {
         return s.current
@@ -69,6 +84,7 @@ export function useActivity(): ActivityAPI {
         a.running = 0
         a.streams.clear()
         a.summaries.clear()
+        a.waveStartAt.clear()
         touch()
       },
       setPhase(p) {
@@ -83,7 +99,7 @@ export function useActivity(): ActivityAPI {
         touch()
       },
       decompose(text) {
-        s.current.decomposeNote = (s.current.decomposeNote + text).slice(-200)
+        s.current.decomposeNote = (s.current.decomposeNote + text).slice(-600)
         touch()
       },
       setPlan(lines) {
@@ -93,6 +109,7 @@ export function useActivity(): ActivityAPI {
         touch()
       },
       waveStart(n, parallel, calls) {
+        s.current.waveStartAt.set(n, Date.now())
         if (s.current.tree) {
           upsertWave(s.current.tree, {
             n,
@@ -142,7 +159,7 @@ export function useActivity(): ActivityAPI {
       },
       nodeStream(key, text) {
         const a = s.current
-        a.streams.set(key, (a.streams.get(key) ?? "") + text)
+        a.streams.set(key, ((a.streams.get(key) ?? "") + text).slice(-2000))
         if (a.tree) {
           for (const w of a.tree.children) {
             const n = w.children.find((c) => c.id === key)
@@ -170,12 +187,67 @@ interface FlatNode {
   node: TaskNode
 }
 
-function WaveHeader({ wave, t }: { wave: TaskNode; t: ThemeTokens }): ReactNode {
+/** 面板布局计算(渲染与鼠标命中检测共用): 波次头/节点行/展开内容 → 行高表 + 块表 + 视口窗口 */
+export function computePanelLayout(
+  state: ActivityState,
+  opts: { expanded: Set<string>; width: number; rows: number; focused: boolean; sel: number },
+): {
+  blocks: Array<{ type: "wave"; w: TaskNode } | { type: "node"; w: TaskNode; n: TaskNode }>
+  rowHeights: number[]
+  start: number
+  startPad: number
+  end: number
+} {
+  const tree = state.tree
+  const waves = (tree?.children ?? []).filter((w) => w.id.startsWith("wave_"))
+  const contentW = Math.max(10, opts.width - 4)
+  const rowHeights: number[] = []
+  const blocks: Array<{ type: "wave"; w: TaskNode } | { type: "node"; w: TaskNode; n: TaskNode }> = []
+  for (const w of waves) {
+    rowHeights.push(1)
+    blocks.push({ type: "wave", w })
+    for (const n of w.children) {
+      let h = 1
+      const st = state.streams.get(n.id)
+      const sum = state.summaries.get(n.id)
+      if (opts.expanded.has(n.id) || n.status === "running") {
+        if (n.error) h += estimateMarkdownHeight(n.error, contentW)
+        if (sum) h += estimateMarkdownHeight(sum, contentW)
+        if (st) h += estimateMarkdownHeight(st.slice(-240), contentW)
+      }
+      if (n.status === "running" && st) h += estimateMarkdownHeight(st.slice(-240), contentW)
+      rowHeights.push(h)
+      blocks.push({ type: "node", w, n })
+    }
+  }
+  let off: number
+  if (opts.focused && opts.sel >= 0) {
+    // 焦点模式: 窗口中心对准选中节点
+    let acc = 0
+    let i = 0
+    for (; i <= opts.sel && i < blocks.length; i++) acc += rowHeights[i]!
+    off = acc - opts.rows / 2
+  } else {
+    off = 1e9 // 贴底
+  }
+  const { start, startPad, end } = computeWindow(rowHeights, opts.rows, off)
+  return { blocks, rowHeights, start, startPad, end }
+}
+
+/** 进度条: 实心 ▰ / 空心 ▱, fill ∈ [0,1] */
+export function progressBar(fill: number, width = 6): string {
+  const clamped = Math.max(0, Math.min(1, fill))
+  const full = Math.round(clamped * width)
+  return "▰".repeat(full) + "▱".repeat(width - full)
+}
+
+function WaveHeader({ wave, t, now }: { wave: TaskNode; t: ThemeTokens; now: number }): ReactNode {
   const num = wave.id.replace("wave_", "")
   const parallel = wave.children.length > 1
   const doneCount = wave.children.filter((c) => c.status === "done" || c.status === "error").length
   let label: string
   let color: string | undefined
+  let bar: string | undefined
   if (wave.status === "running") {
     label = `${parallel ? "⚡" : "→"} 波次 ${num}${parallel ? ` · ${wave.children.length} 并行` : ""}`
     color = t.accent
@@ -186,10 +258,15 @@ function WaveHeader({ wave, t }: { wave: TaskNode; t: ThemeTokens }): ReactNode 
     label = `○ 波次 ${num}`
     color = t.inkFaint
   }
-  return <Text color={color}>{label}</Text>
+  return (
+    <Text color={color}>
+      {label}
+      {wave.status === "running" && bar}
+    </Text>
+  )
 }
 
-const NODE_GLYPH: Record<TaskNode["status"], { char: string; color: keyof ThemeTokens }> = {
+export const NODE_GLYPH: Record<TaskNode["status"], { char: string; color: keyof ThemeTokens }> = {
   pending: { char: "○", color: "inkFaint" },
   running: { char: "◐", color: "accent" },
   done: { char: "✓", color: "ok" },
@@ -203,6 +280,8 @@ function NodeRow({
   expanded,
   stream,
   summary,
+  now,
+  waveStartAt,
 }: {
   node: TaskNode
   t: ThemeTokens
@@ -210,20 +289,28 @@ function NodeRow({
   expanded: boolean
   stream?: string
   summary?: string
+  now: number
+  waveStartAt?: number
 }): ReactNode {
   const g = NODE_GLYPH[node.status]
-  const args = node.args && Object.keys(node.args).length ? ` ${JSON.stringify(node.args).slice(0, 48)}` : ""
+  // 面板体积小 → 只显示简洁信息: 工具名 + 进度条 + 耗时 + 错误(截断)。
+  // 参数/流式输出不进行内(左侧对话流已承载计划骨架与内容, 右侧只做执行状态)。
   const ms = node.ms !== undefined ? ` ${node.ms.toFixed(0)}ms` : ""
+  // 运行中节点: 实时进度条(1.5s 走满) + 已用时长 —— 并行执行"看得见在动"
+  const elapsed = node.status === "running" && waveStartAt !== undefined ? (now - waveStartAt) / 1000 : undefined
+  const bar = node.status === "running" ? ` ${progressBar(elapsed !== undefined ? elapsed / 1.5 : 0.2, 6)}` : ""
+  const elapsedTxt = elapsed !== undefined ? ` ${elapsed.toFixed(1)}s` : ""
   return (
     <Box flexDirection="column" width="100%">
       <Text color={selected ? t.accent : t[g.color]} bold={selected} wrap="wrap">
         {selected ? "▸ " : "  "}
         {g.char} {node.label}
-        {args ? <Text color={t.inkDim}>{args}</Text> : null}
-        <Text color={t.inkFaint}>{ms}</Text>
-        {node.error ? <Text color={t.err}> — {node.error.slice(0, 80)}</Text> : null}
+        <Text color={t.accent}>{bar}</Text>
+        <Text color={t.inkFaint}>{ms || elapsedTxt}</Text>
+        {node.error ? <Text color={t.err}> — {node.error.slice(0, 48)}</Text> : null}
       </Text>
-      {expanded && (stream || summary || node.error) && (
+      {/* 默认展开: 运行中节点始终显示流式内容(执行过程默认可见); 点击可收起 */}
+      {(expanded || node.status === "running") && (stream || summary || node.error) && (
         <Box flexDirection="column" paddingLeft={3} width="100%">
           {node.error && (
             <Text color={t.err} wrap="wrap">
@@ -252,12 +339,18 @@ export function ActivityPanel({
   focused,
   sel,
   expanded,
+  now = Date.now(),
+  width = 40,
+  rows = 20,
 }: {
   state: ActivityState
   t: ThemeTokens
   focused: boolean
   sel: number
   expanded: Set<string>
+  now?: number
+  width?: number
+  rows?: number
 }): ReactNode {
   const tree = state.tree
   if (!tree) return null
@@ -268,10 +361,11 @@ export function ActivityPanel({
   if (state.phase === "decompose") {
     return (
       <Box flexDirection="column" width="100%">
-        <Text color={t.inkDim}>拆解中…</Text>
+        <Text color={t.inkDim}>声明中…</Text>
         {state.decomposeNote && (
-          <Text color={t.inkFaint} wrap="wrap">
+          <Text color={t.inkDim} dimColor wrap="wrap">
             {state.decomposeNote}
+            {state.decomposeNote.length >= 600 ? "…" : ""}
           </Text>
         )}
       </Box>
@@ -296,27 +390,35 @@ export function ActivityPanel({
       </Box>
     )
   }
+  // 面板内部虚拟滚动: 每块(wave 头/节点行/展开内容)估算高度, 只渲染视口窗口。
+  // 焦点导航时窗口跟随选中节点(selection 不滚出视口)。
+  const layout = computePanelLayout(state, { expanded, width, rows, focused, sel })
+  const slice = layout.blocks.slice(layout.start, layout.end)
   return (
     <Box flexDirection="column" width="100%">
-      {waves.map((w) => (
-        <Box key={w.id} flexDirection="column" width="100%">
-          <WaveHeader wave={w} t={t} />
-          {w.children.map((n) => {
-            const idx = flat.findIndex((f) => f.node.id === n.id)
-            return (
-              <NodeRow
-                key={n.id}
-                node={n}
-                t={t}
-                selected={focused && idx === sel}
-                expanded={expanded.has(n.id)}
-                stream={state.streams.get(n.id)}
-                summary={state.summaries.get(n.id)}
-              />
-            )
-          })}
-        </Box>
-      ))}
+      {layout.startPad > 0 && <Box height={layout.startPad} />}
+      {slice.map((b) => {
+        if (b.type === "wave") {
+          return <WaveHeader key={b.w.id} wave={b.w} t={t} now={now} />
+        }
+        const n = b.n
+        const w = b.w
+        const waveStartAt = state.waveStartAt.get(Number(w.id.replace("wave_", "")))
+        const idx = flat.findIndex((f) => f.node.id === n.id)
+        return (
+          <NodeRow
+            key={n.id}
+            node={n}
+            t={t}
+            selected={focused && idx === sel}
+            expanded={expanded.has(n.id)}
+            stream={state.streams.get(n.id)}
+            summary={state.summaries.get(n.id)}
+            now={now}
+            waveStartAt={waveStartAt}
+          />
+        )
+      })}
     </Box>
   )
 }

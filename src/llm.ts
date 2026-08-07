@@ -6,7 +6,7 @@ import type { ChatMessage, LLMStreamOpts, StreamFinish, StreamResult, ToolCall, 
 
 const DEFAULT_MODEL = "gpt-4o-mini"
 const DEFAULT_TIMEOUT_MS = 120_000
-const MAX_RETRIES = 2
+const MAX_RETRIES = 3
 
 export class LLMError extends Error {
   /** true = 可安全重试(网络/5xx/429); false = 不重试(鉴权/4xx/格式) */

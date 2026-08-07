@@ -3,8 +3,10 @@
 //           ② Esc/Tab 不吞键, 交由 App(中断/焦点轮回);
 //           ③ 光标用反白块模拟, 层级克制(Apple 式)。
 // 编码安全: 用码点数组索引, CJK/emoji 不劈断。
+// IME 安全: value/cursor 用 ref 同步镜像 —— 中文输入法一次组合会连发多个事件,
+//           若读 React state(渲染后才更新)会拿到旧值, 光标位置会漂移/丢字。
 
-import React, { useEffect, useState } from "react"
+import React, { useEffect, useRef, useState } from "react"
 import type { ReactNode } from "react"
 import { Box, Text, useInput } from "ink"
 import type { ThemeTokens } from "./theme.ts"
@@ -24,11 +26,26 @@ export function Input({
   focus?: boolean
   t: ThemeTokens
 }): ReactNode {
-  const chars = [...value]
-  const [cursor, setCursor] = useState(chars.length)
+  // ---- 同步镜像: 事件处理器永远读到最新值, 不依赖渲染节奏 ----
+  const valueRef = useRef(value)
+  const cursorRef = useRef([...value].length)
+  const [, force] = useState(0)
+  valueRef.current = value
 
+  const emit = (v: string): void => {
+    valueRef.current = v
+    onChange(v)
+  }
+
+  const setCursor = (n: number): void => {
+    cursorRef.current = n
+    force((x) => x + 1)
+  }
+
+  // 外部重置(提交清空/命令)后夹取光标
   useEffect(() => {
-    setCursor((c) => Math.min(c, [...value].length))
+    cursorRef.current = Math.min(cursorRef.current, [...value].length)
+    force((x) => x + 1)
   }, [value])
 
   useInput((input, key) => {
@@ -39,18 +56,18 @@ export function Input({
     }
     if (key.return) {
       if (onSubmit) {
-        onSubmit(value)
+        onSubmit(valueRef.current)
         return true
       }
       return // 无 onSubmit 时交给上层处理(设置面板 Enter=保存)
     }
-    const cur = [...value].length
+    const cur = [...valueRef.current].length
     if (key.leftArrow) {
-      setCursor((c) => Math.max(0, c - 1))
+      setCursor(Math.max(0, cursorRef.current - 1))
       return true
     }
     if (key.rightArrow) {
-      setCursor((c) => Math.min(cur, c + 1))
+      setCursor(Math.min(cur, cursorRef.current + 1))
       return true
     }
     if (key.home) {
@@ -62,29 +79,32 @@ export function Input({
       return true
     }
     if (key.backspace || key.delete) {
-      const all = [...value]
-      const pos = cursor
+      const all = [...valueRef.current]
+      const pos = cursorRef.current
       if (key.delete) {
         if (pos < all.length) {
           all.splice(pos, 1)
-          onChange(all.join(""))
+          emit(all.join(""))
         }
       } else if (pos > 0) {
         all.splice(pos - 1, 1)
-        onChange(all.join(""))
-        setCursor((c) => Math.max(0, c - 1))
+        emit(all.join(""))
+        setCursor(Math.max(0, pos - 1))
       }
       return true
     }
     if (input) {
-      const all = [...value]
-      all.splice(cursor, 0, ...input)
-      onChange(all.join(""))
-      setCursor(cursor + [...input].length)
+      const all = [...valueRef.current]
+      const pos = cursorRef.current
+      all.splice(pos, 0, ...input)
+      emit(all.join(""))
+      setCursor(pos + [...input].length)
       return true
     }
   })
 
+  const chars = [...value]
+  const cursor = cursorRef.current
   const shown = chars.slice(0, cursor).join("")
   const cur = chars[cursor]
   const rest = chars.slice(cursor + 1).join("")

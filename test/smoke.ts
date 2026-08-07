@@ -261,13 +261,21 @@ async function main(): Promise<void> {
     const planPort = (planSrv.address() as any).port
     const { runPlannedTask } = await import("../src/influx/plan-runner.ts")
     const nodeWaves = new Map<string, number>()
+    const nodeStart = new Map<string, number>()
+    const nodeEnd = new Map<string, number>()
     let curWave = 0
+    let seq = 0
     const t0 = performance.now()
     const pr = await runPlannedTask("smoke", {
       url: `http://127.0.0.1:${planPort}/v1/chat/completions`,
       onEvent: (e) => {
         if (e.type === "wave-start") curWave = e.n
-        if (e.type === "node-start" && e.key !== "root") nodeWaves.set(e.key, curWave)
+        if (e.type === "node-start" && e.key !== "root") {
+          seq++
+          nodeStart.set(e.key, seq)
+          nodeWaves.set(e.key, curWave)
+        }
+        if (e.type === "node-end" && e.key !== "root") nodeEnd.set(e.key, seq++)
       },
     })
     const elapsed = performance.now() - t0
@@ -275,9 +283,50 @@ async function main(): Promise<void> {
     rmSync(dir, { recursive: true, force: true })
     const s1 = nodeWaves.get("s1")!
     check("plan: 3 独立节点同波并行", s1 === nodeWaves.get("s2") && s1 === nodeWaves.get("s3"))
-    check("plan: 依赖链 w>s1 且 r>w", nodeWaves.get("w")! > s1 && nodeWaves.get("r")! > nodeWaves.get("w")!)
+    // 事件驱动调度: 依赖链用"启动顺序"断言(w 在 s1 完成后才启动, r 在 w 完成后才启动)
+    check(
+      "plan: 依赖链 w 在 s1 完成后启动",
+      (nodeStart.get("w") ?? 0) > (nodeEnd.get("s1") ?? 0) && (nodeStart.get("w") ?? 0) > (nodeStart.get("s2") ?? 0),
+    )
+    check("plan: 依赖链 r 在 w 完成后启动", (nodeStart.get("r") ?? 0) > (nodeEnd.get("w") ?? 0))
     check(`plan: 0.3s×3 并行+依赖 <1.6s (${(elapsed / 1000).toFixed(2)}s)`, elapsed < 1600)
     check("plan: 依赖值传递", pr.ok && String((pr.results.r as any)?.content ?? "").includes("x="))
+  }
+
+  // 场景 0a: 事件驱动调度核心承诺 — "小兄弟的下游不等大兄弟"。
+  // boss 有 3 个子任务: big(0.6s) + small1(0.1s) + small2(0.1s);
+  // x 只依赖 small1 → 必须在 big 完成之前启动(波次屏障时代它必须等 big)。
+  {
+    const { mkdtempSync, rmSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "smoke-edsched-"))
+    const { runSpec } = await import("../src/influx/plan-runner.ts")
+    const spec = {
+      type: "flow", key: "root",
+      children: [
+        { type: "task", key: "big", tool: "shell", params: { cmd: "sleep 0.6" } },
+        { type: "task", key: "sm1", tool: "shell", params: { cmd: "sleep 0.1" } },
+        { type: "task", key: "sm2", tool: "shell", params: { cmd: "sleep 0.1" } },
+        { type: "task", key: "x", tool: "shell", params: { cmd: "echo ok" }, dependsOn: ["sm1"] },
+      ],
+    }
+    const order: string[] = []
+    const rep = await runSpec(spec, {
+      cwd: dir,
+      onEvent: (e) => {
+        if (e.type === "node-start") order.push(`s:${e.key}`)
+        if (e.type === "node-end") order.push(`e:${e.key}`)
+      },
+    })
+    check("edsched: 无错误", Object.keys(rep.errors).length === 0, JSON.stringify(rep.errors))
+    check(
+      "edsched: x 在 big 完成前启动(不等大兄弟)",
+      order.indexOf("s:x") < order.indexOf("e:big"),
+      order.join(" "),
+    )
+    check("edsched: x 在 sm1 完成后启动(依赖仍需满足)", order.indexOf("s:x") > order.indexOf("e:sm1"))
+    rmSync(dir, { recursive: true, force: true })
   }
 
   // 场景 0b: VFS 两段式构建 — VBuild 写 overlay 磁盘不动, diff 正确, RBuild commit 落盘
@@ -325,6 +374,7 @@ async function main(): Promise<void> {
     const { VFS } = await import("../src/vfs.ts")
     const vfs = new VFS(dir)
     const waves: string[][] = []
+    const order: string[] = []
     const spec = {
       type: "flow", key: "root",
       children: [
@@ -338,15 +388,20 @@ async function main(): Promise<void> {
       cwd: dir, vfs,
       onEvent: (e) => {
         if (e.type === "wave-start") waves.push([])
-        if (e.type === "node-start") waves[waves.length - 1]!.push(e.key)
+        if (e.type === "node-start") {
+          waves[waves.length - 1]!.push(e.key)
+          order.push(`s:${e.key}`)
+        }
+        if (e.type === "node-end") order.push(`e:${e.key}`)
       },
     })
     check("dual: agent.* 工具可用且无错误", Object.keys(rep.errors).length === 0, JSON.stringify(rep.errors))
-    check("dual: 无依赖节点同波并行", !!(waves[1]?.includes("g1") && waves[1]?.includes("s1")))
+    check("dual: 无依赖节点同波并行", !!(waves[0]?.includes("g1") && waves[0]?.includes("s1")))
+    // 事件驱动调度: 依赖链串行 = r1 启动晚于 g1 结束, w1 启动晚于 r1 结束
     check(
-      "dual: 依赖链串行",
-      waves.findIndex((w) => w.includes("r1")) > waves.findIndex((w) => w.includes("g1")) &&
-        waves.findIndex((w) => w.includes("w1")) > waves.findIndex((w) => w.includes("r1")),
+      "dual: 依赖链串行(r 在 g 后, w 在 r 后)",
+      order.indexOf("s:r1") > order.indexOf("e:g1") && order.indexOf("s:w1") > order.indexOf("e:r1"),
+      order.join(" "),
     )
     check("dual: VBuild 暂存磁盘未动", readFileSync(join(dir, "ui.tsx"), "utf8") === "old content" && vfs.hasChanges())
     await vfs.commit()
@@ -483,6 +538,100 @@ async function main(): Promise<void> {
     const toolCount = result.messages.filter((m) => m.role === "tool").length
     check("并行: 2 条工具回执", toolCount === 2, `count=${toolCount}`)
     check(`并行: 耗时 ${(elapsed / 1000).toFixed(2)}s < 1.8s`, elapsed < 1800, `elapsed=${(elapsed / 1000).toFixed(2)}s`)
+  }
+
+  // Axiom 基准原则: 动态读取(mtime 失效) + 第一部提取 + 模式控制
+  {
+    const { writeFileSync, mkdtempSync, rmSync, utimesSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "axiom-"))
+    const p = join(dir, "axiom.md")
+    const oldPath = process.env.MINICODE_AXIOM_PATH
+    const oldMode = process.env.MINICODE_AXIOM
+    process.env.MINICODE_AXIOM_PATH = p
+    process.env.MINICODE_AXIOM = "core"
+    const { axiomPromptBlock, resolveAxiomMode } = await import("../src/axiom.ts")
+
+    // 写入 v1(含第一部/第二部标题)
+    writeFileSync(p, "前言\n# 第一部 · 测试版 v1\n第1层: 求真\n# 第二部 · 章程\n内容B\n", "utf8")
+    const block1 = axiomPromptBlock()
+    check("core 模式提取第一部", block1.includes("测试版 v1") && block1.includes("求真") && !block1.includes("内容B"), block1.slice(0, 80))
+
+    // 更新为 v2(mtime 变化 → 缓存失效 → 新内容)
+    const future = new Date(Date.now() + 5000)
+    utimesSync(p, future, future)
+    writeFileSync(p, "前言\n# 第一部 · 测试版 v2\n第1层: 求真升级\n# 第二部 · 章程\n内容B\n", "utf8")
+    utimesSync(p, new Date(future.getTime() + 2000), new Date(future.getTime() + 2000))
+    const block2 = axiomPromptBlock()
+    check("文档更新后自动读到新版(动态不写死)", block2.includes("测试版 v2") && !block2.includes("测试版 v1"), block2.slice(0, 80))
+
+    // none 模式: 不注入
+    process.env.MINICODE_AXIOM = "none"
+    check("none 模式不注入", axiomPromptBlock() === "", "")
+    check("模式解析", resolveAxiomMode() === "none")
+
+    // 无标题结构 → 回退全文前段
+    process.env.MINICODE_AXIOM = "core"
+    writeFileSync(p, "没有标题结构的全文内容", "utf8")
+    const block3 = axiomPromptBlock()
+    check("标题缺失回退全文", block3.includes("没有标题结构"), block3.slice(0, 60))
+
+    // 恢复环境
+    if (oldPath === undefined) delete process.env.MINICODE_AXIOM_PATH
+    else process.env.MINICODE_AXIOM_PATH = oldPath
+    if (oldMode === undefined) delete process.env.MINICODE_AXIOM
+    else process.env.MINICODE_AXIOM = oldMode
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  // /undo /redo: 快照回滚与重做
+  {
+    const { writeFileSync, readFileSync, mkdtempSync, rmSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "undo-"))
+    const f = join(dir, "a.txt")
+    writeFileSync(f, "original", "utf8")
+    const undo = await import("../src/undo.ts")
+    undo.newFrame()
+    undo.capture(f, "original", "changed")
+    writeFileSync(f, "changed", "utf8")
+    const r1 = undo.undo()
+    check("undo 恢复原文", r1.restored.length === 1 && readFileSync(f, "utf8") === "original", readFileSync(f, "utf8"))
+    const r2 = undo.redo()
+    check("redo 重放改动", r2.restored.length === 1 && readFileSync(f, "utf8") === "changed", readFileSync(f, "utf8"))
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  // 会话持久化: save/list/load 往返
+  {
+    const { mkdtempSync, rmSync } = await import("node:fs")
+    const { join } = await import("node:path")
+    const { tmpdir } = await import("node:os")
+    const dir = mkdtempSync(join(tmpdir(), "sess-"))
+    const oldHome = process.env.HOME
+    process.env.HOME = dir // 重定向 sessions 目录
+    const sess = await import("../src/session.ts")
+    const id = sess.newSessionId("/tmp/项目X")
+    sess.saveSession({
+      id,
+      cwd: "/tmp/项目X",
+      model: "test",
+      mode: "build",
+      createdAt: Date.now(),
+      msgs: [{ kind: "user", text: "你好", ts: Date.now() }],
+      history: [{ role: "user", content: "你好" }],
+    })
+    const list = sess.listSessions()
+    check("会话已保存并可列出", list.length >= 1 && list.some((s) => s.id === id && s.firstMsg === "你好"), JSON.stringify(list))
+    const loaded = sess.loadSession(id)
+    check("会话可恢复(msgs+history)", loaded?.msgs[0]?.kind === "user" && loaded?.history[0]?.content === "你好")
+    sess.deleteSession(id)
+    check("会话可删除", sess.loadSession(id) === null)
+    if (oldHome === undefined) delete process.env.HOME
+    else process.env.HOME = oldHome
+    rmSync(dir, { recursive: true, force: true })
   }
 
   console.log(`\n${passed} passed, ${failed} failed`)

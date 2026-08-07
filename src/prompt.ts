@@ -1,6 +1,8 @@
-// 系统提示词 —— 工具说明 + 工作区规则(精简版)
+// 系统提示词 —— Axiom 基准 + AGENTS.md 项目规则 + 工具说明 + 工作区规则(精简版)
 
 import type { ToolDef } from "./types.ts"
+import { axiomPromptBlock } from "./axiom.ts"
+import { agentsMDPromptBlock } from "./agentsmd.ts"
 
 export function buildSystemPrompt(opts: { cwd: string; tools: ToolDef[] }): string {
   const toolHelp = opts.tools.map((t) => `- ${t.name}: ${t.description.split("\n")[0] ?? ""}`).join("\n")
@@ -22,5 +24,12 @@ export function buildSystemPrompt(opts: { cwd: string; tools: ToolDef[] }): stri
     "- 需要用户决策或信息不足时, 直接说明, 不要猜测",
     "",
     "回答要求: 简洁、中文为主、直接给结论; 完成任务后用 1-3 行总结改了什么。",
-  ].join("\n")
+    "",
+    // 基准原则: 动态读取仓库 axiom.md(持续维护的底层基调, 见 src/axiom.ts)
+    axiomPromptBlock(),
+    // 项目规则: 动态读取项目根 AGENTS.md(团队/项目专属, 见 src/agentsmd.ts)
+    agentsMDPromptBlock(opts.cwd),
+  ]
+    .filter((s) => s !== "")
+    .join("\n")
 }

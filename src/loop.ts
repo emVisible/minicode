@@ -3,6 +3,7 @@
 // 与 UI 解耦: onEvent 回调暴露流式文本/工具执行, 供 TUI 与 headless 复用
 
 import type { ChatMessage, LoopEvent, LoopOptions, ToolSpec } from "./types.ts"
+import { log } from "./log.ts"
 
 const DEFAULT_MAX_STEPS = 30
 /** 同参数连续调用达到该次数时先注入警告(给模型一次换方式的机会) */
@@ -11,6 +12,10 @@ const DOOM_WARN_THRESHOLD = 3
 const DOOM_ABORT_THRESHOLD = 4
 /** 单次请求的上下文预算; 超限时丢弃最旧的非 system 消息 */
 const MAX_CONTEXT_BYTES = 128 * 1024
+/** 只读停滞守卫: 连续 N 轮没有任何写类调用时注入催促(模型经常纯读探索不动手) */
+const READONLY_NUDGE_ROUNDS = 6
+/** 写类工具: 修改代码才算推进任务(bash/shell 视为动作, 不算写) */
+const WRITE_TOOLS = new Set(["write", "edit", "append", "patch"])
 
 /** 上下文压缩: 序列化体积超预算时, 保留 system + 最新消息, 丢弃最旧消息并注入截断标记 */
 function compactMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -45,6 +50,8 @@ export interface RunResult {
   messages: ChatMessage[]
   finish: "stop" | "max_steps" | "aborted" | "doom_loop"
   steps: number
+  /** 本轮实际执行的写类调用次数(write/edit/append/patch) */
+  writes: number
 }
 
 export async function runAgent(input: RunInput): Promise<RunResult> {
@@ -55,10 +62,14 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
   let lastBatchKey = ""
   let consecutive = 0
   let steps = 0
+  let writes = 0
+  /** 自最近一次写类调用以来的只读轮数(停滞守卫) */
+  let readOnlySinceWrite = 0
+  let nudgeInjected = false
 
   while (true) {
-    if (signal?.aborted) return { messages, finish: "aborted", steps }
-    if (steps >= maxSteps) return { messages, finish: "max_steps", steps }
+    if (signal?.aborted) return { messages, finish: "aborted", steps, writes }
+    if (steps >= maxSteps) return { messages, finish: "max_steps", steps, writes }
     steps++
     onEvent?.({ type: "step", n: steps })
 
@@ -75,7 +86,8 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
     const calls = req.message.tool_calls
     if (!calls?.length) {
       onEvent?.({ type: "done", finish: req.finish })
-      return { messages, finish: "stop", steps }
+      log.info("agent", `完成, ${steps} 步`, { finish: req.finish })
+      return { messages, finish: "stop", steps, writes }
     }
 
     // doom-loop 保护: 以「整批调用签名」为单位比较, 而不是单个调用。
@@ -88,13 +100,15 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
     lastBatchKey = batchKey
     const first = calls[0]!
     if (consecutive >= DOOM_ABORT_THRESHOLD) {
+      log.warn("agent", "死循环保护中止", { tool: first.function.name, consecutive, batchKey: batchKey.slice(0, 200) })
       messages.push({
         role: "assistant",
         content: `检测到死循环: 工具 ${first.function.name} 以相同参数连续 ${consecutive} 波次重复调用(警告后仍未改变), 已中止。请换一种方式。`,
       })
-      return { messages, finish: "doom_loop", steps }
+      return { messages, finish: "doom_loop", steps, writes }
     }
     if (consecutive === DOOM_WARN_THRESHOLD) {
+      log.warn("agent", "死循环警告", { tool: first.function.name, consecutive })
       // 针对常见循环的具体建议, 引导模型走出重复
       const hint =
         first.function.name === "read"
@@ -122,6 +136,28 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
       parallel: callMeta.length > 1,
       calls: callMeta.map(({ id, tool, args }) => ({ id, tool, args })),
     })
+    log.debug("agent", `波次 ${steps}`, { parallel: callMeta.length > 1, calls: callMeta.map((c) => c.tool) })
+
+    // 只读停滞守卫: 连续多轮没有任何写调用时, 注入催促让模型动手(而不是继续纯读/询问)。
+    // 只注入一次, 给模型一次修正机会; 若仍不写, 由上层(writes=0)如实报告"未修改任何文件"。
+    const hasWrite = callMeta.some((c) => WRITE_TOOLS.has(c.tool))
+    if (hasWrite) {
+      writes++
+      readOnlySinceWrite = 0
+    } else {
+      readOnlySinceWrite++
+      if (!nudgeInjected && readOnlySinceWrite >= READONLY_NUDGE_ROUNDS) {
+        nudgeInjected = true
+        log.warn("agent", "只读停滞催促", { steps, readOnlyRounds: readOnlySinceWrite })
+        messages.push({
+          role: "system",
+          content:
+            `[执行提醒] 你已连续 ${readOnlySinceWrite} 轮只读/询问, 尚未修改任何文件。` +
+            `任务要求实际产出: 现在必须用 write 重写目标文件完成改动, 或用 bash 执行构建/测试验证。` +
+            `不要继续只读探索, 不要向用户提问。`,
+        })
+      }
+    }
 
     const results = await Promise.all(
       callMeta.map(async ({ call, id, tool, args }) => {
@@ -140,14 +176,18 @@ export async function runAgent(input: RunInput): Promise<RunResult> {
             signal,
             ask: input.ask,
             ...(input.vfs ? { vfs: input.vfs } : {}),
+            // bash 等流式工具: 实时回传执行输出(对话流同步可见)
+            onStream: (text: string) => onEvent?.({ type: "text", text: text.slice(-500) }),
           })
           const ms = performance.now() - t0
           onEvent?.({ type: "tool-result", id, tool, ms })
+          log.debug("agent", `工具成功 ${tool}`, { id, ms })
           return { id, tool, ms, error: undefined, content: out.output }
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e)
           const ms = performance.now() - t0
           onEvent?.({ type: "tool-result", id, tool, ms, error: errMsg })
+          log.warn("agent", `工具失败 ${tool}`, { id, ms, error: errMsg.slice(0, 500) })
           return { id, tool, ms, error: errMsg, content: `工具错误: ${errMsg}` }
         }
       }),

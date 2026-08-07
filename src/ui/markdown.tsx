@@ -29,7 +29,7 @@ function charDisplayWidth(ch: string): number {
   return wide ? 2 : 1
 }
 
-function displayWidth(s: string): number {
+export function displayWidth(s: string): number {
   let w = 0
   for (const ch of s) w += charDisplayWidth(ch)
   return w

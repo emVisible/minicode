@@ -1,6 +1,6 @@
 # MiniCode
 
-Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式计划运行时。零第三方运行时依赖(仅 UI 用 Ink、MCP 用官方 SDK),自写 OpenAI Chat Completions SSE 流式客户端与 tool-call 回环。
+Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式计划运行时。核心链路(LLM SSE 客户端、tool-call 回环、计划运行时、VFS、TUI)全部自研; 第三方依赖仅限 UI 渲染(Ink/React)、远端请求(undici)、模式校验(zod)与 MCP 官方 SDK。
 
 设计参考 opencode([anomalyco/opencode](https://github.com/anomalyco/opencode)) 的会话/工具/循环架构,做最小裁剪。原 [Influx](../Influx) 项目(声明式批处理运行时)已并入本仓库 `src/influx/`,统一入口与工具层:
 
@@ -29,19 +29,27 @@ Mini opencode: 一个终端里的对话式编码 agent + 内嵌 Influx 声明式
   - **Markdown 渲染**(`src/ui/markdown.tsx`): 标题(字重分层,不显示 #)/ 无序·有序·任务·嵌套列表 / **表格**(CJK 全角宽度对齐)/ 代码块(左 rail + 微底色 + JSON/bash/TS 迷你高亮)/ 引用 rail / 分隔线(细发线)/ 行内 `code`、**bold**、*italic*、~~strike~~、链接; 宽度感知(活动面板展开时自动收窄)
   - **启动欢迎卡片**(`src/ui/welcome.tsx`): wordmark + 命令网格, 首条消息前展示
   - **消息呈现**: 用户消息带 `你` 头 + 右对齐时间戳; 助手消息左侧淡紫蓝 rail; 运行结论为单行裁定 `✓ 全并行 3 波 · 2.0s` + 变更明细(dim); 工具事件不再混入对话流
-  - **活动面板**(`src/ui/activity.tsx`): 运行时右 40% —— 波次 header(⚡ 并行数/✓ 完成数) + 节点行(○/◐/✓/✗ + 工具名 + 耗时); 运行中 Tab 焦点轮回: ↑↓ 选择、Enter 展开/收起节点输出、`e` 全展开、Esc 返回; 完成后收回为对话流内的结论行
+  - **并行执行可视化(过程可见, MiniCode 特色)**: 左侧对话流实时"过程 feed" —— 当前波次(⚡ 波次 N · M 并行 · K 运行中)+ 各节点状态与**运行中节点的流式输出**(llm 生成内容逐块可见); 右侧面板波次/节点带**实时进度条**(▰▱ 填充, 1.5s 走满)+ 已用时长; 状态栏显示 `执行中 · 波次 X/Y`; 完成后 feed 收敛为结论行
+  - **活动面板**(`src/ui/activity.tsx`): 运行时右 32% —— 波次 header(⚡ 并行数/✓ 完成数) + 节点行(○/◐/✓/✗ + 进度条 + 耗时); 运行中 Tab 焦点轮回: ↑↓ 选择、Enter 展开/收起节点输出、`e` 全展开、Esc 返回; 完成后收回为对话流内的结论行
   - **全屏解耦**: 交互模式进入 alternate screen buffer(OSC 1049), TUI 独占整屏、不污染终端滚动历史; 退出时原样恢复调用方终端(参考 tmux/opencode 客户端模式)
   - **Plan / Build 双模式**(Tab 切换): Plan 模式提交任务 → 只生成计划(DAG 骨架实时流式展示在活动面板, 不执行), 计划记入会话历史; Build 模式提交 → 完整执行(自动拆解 → VBuild → RBuild 确认落盘)。先想清楚, 再动手
+- **拆解过程可见**: 拆解阶段 LLM 流式输出实时显示在对话流(左 rail 块, 含已等待时长), 活动面板同步 —— 全程不是黑盒
+- **输入行质感**: 底部固定圆角填充输入框(背景微色 + 边框), 焦点时边框亮起; 自研输入行对 IME 安全(ref 同步镜像, 中文输入法连发事件不再导致光标漂移/丢字)
   - **任务树数据层**(`src/ui/tree.tsx`): 从运行事件增量构建(幂等), 渲染与数据分离
   - **`/plan <任务>`**: 让 LLM 把任务拆解为 DAG 计划, 交给 Influx 运行时**全并行执行**(无依赖节点同波并行, 依赖链自动串行) —— 对话理解 + 计划执行的"1+1>2"
   - **thinking 过程可视化**: 拆解阶段 LLM 生成的计划 JSON 流式显示在活动面板(实时滚动), 完成后对话流输出计划骨架摘要 —— 不再是"黑盒等待后突然出结果"
   - **拆解约束**: 拆解 LLM 禁止用 llm 节点做任务主体, 强制 agent.read/glob/grep + write-file 等文件工具; 纯分析 spec 自动回退对话执行
-  - **`/vbuild <任务>` 两段式构建(VBuild → RBuild)**: 所有 write/edit 先进内存 overlay(VBuild, 虚拟文件系统 `src/vfs.ts`), 全程零磁盘副作用; 完成后展示 diff(+ 新建 / ~ 修改 / − 删除), 输入 y 才 **RBuild 并行批量落盘**, 输入 n 丢弃(可回滚)。`/plan` 同样走两段式
+  - **`/vbuild <任务>` 两段式构建(VBuild → RBuild)**: 所有 write/edit 先进内存 overlay(VBuild, 虚拟文件系统 `src/vfs.ts`), 全程零磁盘副作用; 完成后展示 diff(+ 新建 / ~ 修改 / − 删除), 输入 y 才 **RBuild 并行批量落盘**, 输入 n 丢弃(可回滚)。`/plan` 同样走两段式。**shell 可见性**: 执行 shell/bash 节点前自动把暂存的创建/修改 flush 到磁盘(`flushToDisk`), 因此 `write fix.sh → bash fix.sh` 能拿到构建中的文件; 丢弃构建时 flush 过的文件自动恢复原文
   - 状态栏: 右侧实时显示 `⠋ 拆解中 / 执行中 ×N` + 吞吐 `Nc/s`; 流式响应 60s 无数据自动报错(服务器挂起检测)
   - **诊断托盘**: `Ctrl+d` 展开/收起 —— 拆解失败原因、死循环警告、节点错误等默认折叠为细字, 信息永远可达但不占视觉
   - **内置设置面板**: TUI 内 `Ctrl+o`(或 `/config`)呼出,配置 LLM URL / API Key / Model,Enter 保存即生效并持久化到 `~/.minicode/config.json`(0600 权限,原子写);环境变量优先于配置文件
 - **双引擎自动分流**: 每条消息先尝试由 LLM 拆解为 Influx DAG(1 次快速调用), ≥2 个可并行节点(文件/命令/远端 API) → 自动走 Influx 全并行执行(波次调度); 拆解失败/纯问答 → 回退对话循环。默认路径就吃上 Influx 并行能力, 无需手动 `/plan`
   - 拆解**重试机制**: 首次返回非合法 JSON 时, 把模型自己的输出回喂让其修正(一次机会); 解析容错(剥 markdown 代码块/前后文字/单引号/尾逗号); 限时 90s
+- **AGENTS.md 项目规则**(对齐 opencode `/init`): 动态读取项目根 `AGENTS.md`(mtime 失效, ≤32KB)注入对话与拆解两处系统提示词; `/init` 命令让模型分析项目并生成/刷新 AGENTS.md(写入前需确认), 后续所有 session 自动注入
+- **会话持久化**(对齐 opencode session): 对话自动落盘 `~/.minicode/sessions/`(防抖 800ms); `/sessions` 列出并按序号恢复; 启动 `--resume`/`-r` 自动恢复最近会话
+- **/undo /redo**(对齐 opencode 撤销): 每次执行开启快照帧, 工具层写磁盘前记录原文(对话 write/edit、VBuild→RBuild 落盘均覆盖); `/undo` 逐帧回滚(新建→删除、修改→还原), `/redo` 重放
+- **Axiom 基准原则嵌入 session**(`src/axiom.ts`): 仓库根 `axiom.md`(用户长期维护的从书式 AI 长期协作体系)是唯一真相源, **动态读取、绝不写死** —— 每次构建系统提示词按 mtime 重读, 文档更新后新 session 自动使用最新版。模式 `MINICODE_AXIOM=core|full|none`(默认 core): core 动态提取「第一部 · 从书式长期协作提示词」(文档自述可直接载入系统提示词的执行层, ~2.4K token), full 注入全文(>400KB 拒绝), none 关闭。对话引擎与拆解生成器共用同一基准; `MINICODE_AXIOM_PATH` 可指向其他项目副本
+- **完整日志体系**(`src/log.ts`): 分级日志(debug/info/warn/error, `MINICODE_LOG_LEVEL` 控制)落盘 `~/.minicode/logs/minicode-YYYYMMDD.log`(按天分文件, 超 2MB 轮转); 结构化行 `[ISO时间] [级别] [作用域] 消息 {json}`; 埋点覆盖: 会话生命周期 / TUI 运行(拆解成败、引擎选择、构建结论) / agent 波次与工具成败 / influx 波次与节点错误 / RBuild 落盘; **崩溃兜底**(uncaughtException/unhandledRejection 带堆栈入日志); TUI 内 `/log` 命令回显最近 40 行
 - **预测式预取**(计划 = 模型对自身后续行为的预测): 拆解阶段 LLM 还在流式生成计划 JSON 时, 就把其中声明的 `read-file` 路径**并行预读**进缓存(IO 隐藏在 LLM 延迟之后); 执行阶段运行时在每波开始前**预热下一就绪前沿的读输入**(DAG 已知下波要读什么)。`read-file` 命中缓存直接返回(标记 `prefetched`), `write-file` 真实写入后自动作废对应缓存防过期
 - **拆解过程可视化**: LLM 生成计划 JSON 时流式显示在任务树占位节点(note 实时滚动), 完成后对话流输出 `📝 拆解分析:` 摘要 —— 不再是"黑盒等待后突然出结果"
 - **计划执行全链路可见**: 被阻断节点也发 node-start/node-end 事件(依赖失败原因展示在任务树); 执行结束输出「✓ 构建完成: N 波, 总耗时 Xs」+ VFS diff(相对路径)
@@ -115,7 +123,12 @@ src/
   ui/theme.ts        设计令牌(dark/light 淡紫蓝) + 自动主题检测
   ui/activity.tsx    活动面板(useActivity 事件桥 + 波次/节点渲染 + 焦点导航)
   ui/markdown.tsx    终端 Markdown 渲染(表格/列表/代码高亮/rail)
-  ui/input.tsx       自定义输入行(Ctrl 组合键不插入文本)
+  ui/input.tsx       自定义输入行(Ctrl 组合键不插入文本, IME 安全光标)
+  log.ts             日志体系(分级/落盘/轮转/崩溃兜底)
+  axiom.ts           Axiom 基准原则(动态读取 axiom.md, 按 mtime 失效)
+  agentsmd.ts        AGENTS.md 项目规则(动态读取 + /init 生成)
+  session.ts         会话持久化(save/list/load/--resume)
+  undo.ts            /undo /redo 文件级快照回滚
   ui/settings.tsx    设置面板(Ctrl+o 呼出)
   ui/tree.tsx        任务树数据层(事件增量构建, 幂等)
   ui/welcome.tsx     启动欢迎卡片(wordmark + 命令网格)

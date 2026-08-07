@@ -1,12 +1,10 @@
 // 内置工具注册表: read / write / bash —— M1 最小集
 // 输出统一为字符串(直接回喂模型); 读类 allow, 写/bash 默认 ask(由 UI 决定)
 
-import { exec as execCb } from "node:child_process"
-import { promisify } from "node:util"
+import { runCommandStreaming, runCommandError } from "./exec-stream.ts"
 import type { ToolDef } from "./types.ts"
 import { getTool as getInfluxTool } from "./influx/tools.ts"
-
-const exec = promisify(execCb)
+import { capture as undoCapture } from "./undo.ts"
 
 const MAX_READ_LINES = 2000
 const MAX_READ_BYTES = 50 * 1024
@@ -118,7 +116,7 @@ const writeTool: ToolDef = {
     required: ["path", "content"],
   },
   async execute(args, ctx) {
-    const { mkdirSync, writeFileSync, statSync } = await import("node:fs")
+    const { mkdirSync, writeFileSync, statSync, readFileSync, existsSync } = await import("node:fs")
     const { resolve, dirname } = await import("node:path")
     const path = String(args.path ?? "")
     const content = String(args.content ?? "")
@@ -134,6 +132,8 @@ const writeTool: ToolDef = {
       ctx.vfs.write(filepath, content)
       return { output: `[vbuild] 已暂存 ${filepath} (${Buffer.byteLength(content)} 字节, 待 RBuild 落盘)` }
     }
+    // /undo 快照: 记录磁盘原文与目标内容
+    undoCapture(filepath, existsSync(filepath) ? readFileSync(filepath, "utf8") : null, content)
     mkdirSync(dirname(filepath), { recursive: true })
     writeFileSync(filepath, content, "utf8")
     return { output: `已写入 ${filepath} (${statSync(filepath).size} 字节)` }
@@ -162,14 +162,20 @@ const bashTool: ToolDef = {
       summary: cmd.slice(0, 120),
     })
     if (!ok) throw new Error("[bash] 用户拒绝了命令执行")
-    const { stdout, stderr } = await exec(cmd, {
-      timeout: Number(args.timeoutMs ?? 30000),
+    // VBuild 模式: bash 读真实磁盘, 先把暂存的创建/修改刷到磁盘(构建中的世界对命令可见)
+    ctx.vfs?.flushToDisk()
+    // 流式执行: stdout/stderr 实时回传(并行执行可视化; 长命令不再"零信息运行")
+    const r = await runCommandStreaming({
+      cmd,
       cwd: ctx.cwd,
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      timeoutMs: Number(args.timeoutMs ?? 30000),
+      signal: ctx.signal,
+      onChunk: (text) => ctx.onStream?.(text.length > 500 ? text.slice(-500) + "\n…" : text),
     })
+    if (r.code !== 0) throw runCommandError(r, cmd)
     return {
       output: truncateText(
-        [stdout.trim() ? `[stdout]\n${stdout.trim()}` : "", stderr.trim() ? `[stderr]\n${stderr.trim()}` : ""]
+        [r.stdout.trim() ? `[stdout]\n${r.stdout.trim()}` : "", r.stderr.trim() ? `[stderr]\n${r.stderr.trim()}` : ""]
           .filter(Boolean)
           .join("\n") || "(无输出)",
       ),
@@ -362,6 +368,8 @@ const editTool: ToolDef = {
     if (!original.includes(oldString)) throw new Error(`[edit] 在 ${path} 中未找到: ${oldString.slice(0, 80)}`)
     const count = Math.max(1, Number(args.count ?? 1))
     const replaced = count === 1 ? original.replace(oldString, String(args.newString ?? "")) : original.split(oldString).join(String(args.newString ?? ""))
+    // /undo 快照
+    undoCapture(path, original, replaced)
     writeFileSync(path, replaced, "utf8")
     return {
       output:
