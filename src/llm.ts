@@ -1,8 +1,8 @@
 // 自写 OpenAI Chat Completions SSE 流式客户端 —— 零第三方依赖
 // 端点: url 参数 > LLM_URL 环境变量; 鉴权: LLM_API_KEY / API_KEY; 模型: LLM_MODEL
-// 流式聚合 content / tool_calls delta, 支持超时、退避重试、AbortSignal 中断
+// 纯文本流式聚合 content, 支持超时、退避重试、AbortSignal 中断
 
-import type { ChatMessage, LLMStreamOpts, StreamFinish, StreamResult, ToolCall, Usage } from "./types.ts"
+import type { ChatMessage, LLMStreamOpts, StreamFinish, StreamResult, Usage } from "./types.ts"
 
 const DEFAULT_MODEL = "gpt-4o-mini"
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -30,26 +30,12 @@ export interface LLMClientOptions {
   timeoutMs?: number
 }
 
-interface AggState {
-  text: string
-  calls: Map<number, { id: string; name: string; arguments: string }>
-  finish: StreamFinish
-  usage: Usage
-}
-
-function newState(): AggState {
-  return { text: "", calls: new Map(), finish: "stop", usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }
-}
-
 function buildBody(opts: LLMStreamOpts): Record<string, unknown> {
   return {
     model: opts.model ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
     messages: opts.messages,
-    ...(opts.tools.length
-      ? { tools: opts.tools.map((t) => ({ type: "function", function: t })), tool_choice: "auto" }
-      : {}),
     stream: true,
-    temperature: opts.temperature ?? 0.2,
+    temperature: opts.temperature ?? 0.7,
   }
 }
 
@@ -111,7 +97,6 @@ export class LLMClient {
       throw new LLMError(`[llm] HTTP ${res.status}: ${t.slice(0, 300)}`, res.status >= 500 || res.status === 429)
     }
 
-    const state = newState()
     const t0 = performance.now()
     let firstTokenAt = 0
     const ctype = res.headers.get("content-type") ?? ""
@@ -122,7 +107,7 @@ export class LLMClient {
       const ttft = performance.now() - t0
       const usage = toUsage(json)
       return {
-        message: { role: "assistant", content: msg?.content ?? "", ...(msg?.tool_calls?.length ? { tool_calls: msg.tool_calls } : {}) },
+        message: { role: "assistant", content: msg?.content ?? "" },
         finish: (json.choices?.[0]?.finish_reason as StreamFinish) ?? "stop",
         usage,
         ttft,
@@ -130,21 +115,27 @@ export class LLMClient {
       }
     }
 
+    let text = ""
+    let finish: StreamFinish = "stop"
+    let usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+
     const timedDelta = (e: { type: "text-delta"; text: string }) => {
       if (!firstTokenAt) firstTokenAt = performance.now()
       opts.onDelta?.(e)
     }
-    await this.readSSE(res, state, timedDelta)
-    const calls = [...state.calls.values()]
-      .filter((c) => c.name)
-      .map((c): ToolCall => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.arguments } }))
+    await this.readSSE(res, {
+      onDelta: timedDelta,
+      onText: (t) => (text += t),
+      onFinish: (f) => (finish = f),
+      onUsage: (u) => (usage = u),
+    })
     const total = performance.now() - t0
     const ttft = firstTokenAt ? firstTokenAt - t0 : total
-    const outTokens = state.text.length / 4 // 粗略: 中文约 4 字符/token, 英文约 4 字符/token
+    const outTokens = text.length / 4
     return {
-      message: { role: "assistant", content: state.text, ...(calls.length ? { tool_calls: calls } : {}) },
-      finish: state.finish,
-      usage: state.usage,
+      message: { role: "assistant", content: text },
+      finish,
+      usage,
       ttft,
       tps: outTokens > 0 && total - ttft > 0 ? (outTokens / (total - ttft)) * 1000 : undefined,
     }
@@ -152,16 +143,20 @@ export class LLMClient {
 
   private async readSSE(
     res: Response,
-    state: AggState,
-    onDelta?: (e: { type: "text-delta"; text: string }) => void,
+    handlers: {
+      onDelta: (e: { type: "text-delta"; text: string }) => void
+      onText: (t: string) => void
+      onFinish: (f: StreamFinish) => void
+      onUsage: (u: Usage) => void
+    },
   ): Promise<void> {
     if (!res.body) throw new LLMError("[llm] 响应体为空", true)
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
 
-    // idle 超时: 流开始后 60s 无数据(服务器挂起/网络断开) → 报错而不是无限等
-    const IDLE_TIMEOUT_MS = 60_000
+    // idle 超时: 流开始后 45s 无数据(服务器挂起/网络断开) → 报错而不是无限等
+    const IDLE_TIMEOUT_MS = 45_000
     let idleTimer: ReturnType<typeof setTimeout> | null = null
     let idleFired = false
     const armIdle = () => {
@@ -180,7 +175,7 @@ export class LLMClient {
       let data = line.slice(idx + 1)
       if (data.startsWith(" ")) data = data.slice(1)
       if (key !== "data" || !data || data === "[DONE]") return
-      this.parseChunk(state, data, onDelta)
+      this.parseChunk(data, handlers)
     }
 
     try {
@@ -189,7 +184,7 @@ export class LLMClient {
         try {
           chunk = await reader.read()
         } catch {
-          if (idleFired) throw new LLMError("[llm] 流式响应 60s 无数据(服务器挂起?), 已中断", true)
+          if (idleFired) throw new LLMError("[llm] 流式响应 45s 无数据(服务器挂起?), 已中断", true)
           throw new LLMError("[llm] 流式读取中断", true)
         }
         if (chunk.done) break
@@ -209,9 +204,13 @@ export class LLMClient {
   }
 
   private parseChunk(
-    state: AggState,
     data: string,
-    onDelta?: (e: { type: "text-delta"; text: string }) => void,
+    handlers: {
+      onDelta: (e: { type: "text-delta"; text: string }) => void
+      onText: (t: string) => void
+      onFinish: (f: StreamFinish) => void
+      onUsage: (u: Usage) => void
+    },
   ): void {
     let json: any
     try {
@@ -222,18 +221,11 @@ export class LLMClient {
     const choice = json.choices?.[0]
     const delta = choice?.delta
     if (delta?.content) {
-      state.text += delta.content
-      onDelta?.({ type: "text-delta", text: delta.content })
+      handlers.onText(delta.content)
+      handlers.onDelta({ type: "text-delta", text: delta.content })
     }
-    for (const raw of delta?.tool_calls ?? []) {
-      const call = state.calls.get(raw.index) ?? { id: "", name: "", arguments: "" }
-      if (raw.id) call.id = raw.id
-      if (raw.function?.name) call.name = raw.function.name
-      if (raw.function?.arguments) call.arguments += raw.function.arguments
-      state.calls.set(raw.index, call)
-    }
-    if (choice?.finish_reason) state.finish = choice.finish_reason as StreamFinish
-    if (json.usage) state.usage = toUsage(json)
+    if (choice?.finish_reason) handlers.onFinish(choice.finish_reason as StreamFinish)
+    if (json.usage) handlers.onUsage(toUsage(json))
   }
 }
 

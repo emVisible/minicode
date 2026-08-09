@@ -9,38 +9,32 @@ export interface CommandDef {
 }
 
 export const COMMANDS: CommandDef[] = [
-  { name: "plan", usage: "/plan <任务>", desc: "拆解为 DAG 并并行执行" },
-  { name: "vbuild", usage: "/vbuild <任务>", desc: "声明 → 执行: 先生成执行声明, 再按声明构建" },
-  { name: "parallel", usage: "/parallel <N>", desc: "设置执行并发上限(默认 min(8, CPU 核))" },
-  { name: "init", usage: "/init", desc: "分析项目生成 AGENTS.md" },
   { name: "editor", usage: "/editor", desc: "用外部编辑器撰写消息($EDITOR, 如 code --wait)" },
   { name: "export", usage: "/export", desc: "导出会话为 Markdown 文件" },
   { name: "compact", usage: "/compact", desc: "把长会话压缩成摘要(释放上下文)" },
   { name: "sessions", usage: "/sessions", desc: "会话列表 / 恢复", aliases: ["resume"] },
-  { name: "undo", usage: "/undo", desc: "撤销上一轮文件改动" },
-  { name: "redo", usage: "/redo", desc: "重做撤销" },
   { name: "new", usage: "/new", desc: "新会话(清空当前)", aliases: ["clear", "reset"] },
-  { name: "details", usage: "/details", desc: "展开 / 收起全部节点详情" },
   { name: "connect", usage: "/connect", desc: "配置 LLM 提供方(URL / Key / 模型)", aliases: ["config"] },
   { name: "models", usage: "/models", desc: "当前模型信息" },
-  { name: "themes", usage: "/themes", desc: "切换明暗主题" },
+  { name: "themes", usage: "/themes", desc: "切换明暗主题(写入配置持久保存)" },
+  { name: "dense", usage: "/dense", desc: "切换消息紧凑/宽松间距(写入配置持久保存)" },
   { name: "log", usage: "/log", desc: "查看日志文件" },
   { name: "help", usage: "/help", desc: "命令列表" },
   { name: "quit", usage: "/quit", desc: "退出", aliases: ["exit", "q"] },
 ]
 
-/** ctrl+x 领衔快捷键(对齐 opencode keybinds): ctrl+x 后 2 秒内按第二键 */
+/** ctrl+x 领衔快捷键: ctrl+x 后 2 秒内按第二键 */
 export const LEADER_KEYS: Record<string, string> = {
-  u: "undo",
-  r: "redo",
   n: "new",
   l: "sessions",
   t: "themes",
   m: "models",
   e: "editor",
   x: "export",
-  c: "compact",
+  c: "copy",
+  v: "copyq",
   d: "diag",
+  g: "dense",
   p: "help",
   q: "quit",
   "?": "help",

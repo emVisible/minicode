@@ -1,48 +1,31 @@
 {
   "name": "minicode",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
-  "description": "Mini opencode: SSE 流式 LLM + tool-call 回环的对话式编码 agent, 内嵌 Influx 声明式计划运行时 (plan run/bench/view + MCP 编排), 支持计划内嵌对话(llm 节点 agent 模式)",
+  "description": "终端里的对话式 LLM 聊天工具: SSE 流式 + 全屏 TUI + 命令行模式 + 项目内缓存, 无工具调用",
   "bin": {
-    "minicode": "src/cli.ts"
+    "minicode": "dist/minicode.mjs"
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
     "headless": "tsx src/cli.ts --headless",
-    "plan:run": "tsx src/cli.ts plan run",
-    "plan:bench": "tsx src/cli.ts plan bench",
-    "plan:view": "tsx src/cli.ts plan view",
-    "demo": "tsx src/cli.ts plan run examples/demo.plan.tsx",
-    "demo:rerun": "tsx src/cli.ts plan run examples/demo.plan.tsx --rerun",
-    "demo:serial": "tsx src/cli.ts plan run examples/demo.plan.tsx --serial",
-    "demo:shell": "tsx src/cli.ts plan run examples/shell.plan.tsx",
-    "demo:fs": "tsx src/cli.ts plan run examples/fs-demo.plan.tsx",
-    "demo:llm": "tsx src/cli.ts plan run examples/llm-demo.plan.tsx",
-    "demo:agent": "tsx src/cli.ts plan run examples/agent-demo.plan.tsx",
-    "bench": "tsx src/cli.ts plan bench examples/demo.plan.tsx",
-    "webui": "tsx src/cli.ts plan view examples/demo.plan.tsx",
-    "webui:shell": "tsx src/cli.ts plan view examples/shell.plan.tsx",
-    "mcp": "tsx src/influx/mcp.ts",
     "smoke": "tsx test/smoke.ts",
-    "smoke:influx": "tsx test/influx-smoke.ts",
-    "smoke:plan-fixes": "tsx test/plan-fixes.ts",
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.plans.json --noEmit",
-    "smoke:ui": "tsx test/ui-utils.ts"
+    "typecheck": "tsc --noEmit",
+    "smoke:ui": "tsx test/ui-utils.ts",
+    "smoke:tui": "tsx test/tui-e2e.ts",
+    "build": "node scripts/build.mjs"
   },
   "engines": {
     "node": ">=20.12"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
     "ink": "^7.1.1",
-    "ink-text-input": "^6.0.0",
-    "react": "^19.2.8",
-    "undici": "^8.10.0",
-    "zod": "^4.4.3"
+    "react": "^19.2.0"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
+    "esbuild": "^0.25.0",
     "tsx": "^4.23.9",
     "typescript": "^5.9.3"
   }

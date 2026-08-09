@@ -6,17 +6,16 @@ import type { ReactNode } from "react"
 import { Box, Text } from "ink"
 import type { ThemeTokens } from "./theme.ts"
 
-export function WelcomeCard(props: { cwd: string; model: string; toolCount: number; t: ThemeTokens }): ReactNode {
-  const { cwd, model, toolCount, t } = props
+export function WelcomeCard(props: { cwd: string; model: string; t: ThemeTokens }): ReactNode {
+  const { cwd, model, t } = props
   const rows: Array<[string, string]> = [
-    ["Tab", "Plan / Build 模式切换"],
-    ["/plan", "拆解为 DAG 并执行"],
-    ["/vbuild", "声明 → 执行 → 确认落盘"],
-    ["/editor", "外部编辑器撰写消息"],
-    ["/sessions", "会话列表 · 输入序号恢复"],
-    ["/undo /redo", "撤销 / 重做文件改动"],
-    ["/connect", "配置模型连接"],
-    ["/quit", "退出"],
+    ["Tab", "切换 对话模式 ↔ 命令行(shell)"],
+    ["Ctrl+o", "配置 LLM(URL / Key / 模型)"],
+    ["Ctrl+x c", "复制最后回答 · Ctrl+x v 复制我的问题"],
+    ["长输入", "自动弹出预览窗确认(Enter 发送 · Esc 收起)"],
+    ["Ctrl+x l", "会话列表 / 切换"],
+    ["Ctrl+x x", "导出 Markdown 转录"],
+    ["Ctrl+C ×2", "退出(仅此一种方式, Esc 不退出)"],
   ]
   return (
     <Box flexDirection="column" width="100%">
@@ -24,7 +23,7 @@ export function WelcomeCard(props: { cwd: string; model: string; toolCount: numb
         minicode
       </Text>
       <Text color={t.inkDim}>
-        {cwd} · {model} · {toolCount} 工具
+        {cwd} · {model}
       </Text>
       <Box flexDirection="column" marginTop={1}>
         {rows.map(([k, v], i) => (
@@ -37,7 +36,7 @@ export function WelcomeCard(props: { cwd: string; model: string; toolCount: numb
         ))}
       </Box>
       <Text color={t.inkFaint} dimColor>
-        提示: @文件 补全 · !命令 直跑 shell · /help 全部命令 · ctrl+x 领衔快捷键
+        纯对话 + 命令行双模式: 模型只回文本不调用工具 · 会话缓存于项目 .minicode/ · /help 全部命令
       </Text>
     </Box>
   )

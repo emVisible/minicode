@@ -1,11 +1,11 @@
-// 新模块单元测试: 视口窗口计算 / 命令注册表 / @引用与!shell 解析
+// 新模块单元测试: 视口窗口计算 / 命令注册表 / 鼠标代理
 // 运行: pnpm exec tsx test/ui-utils.ts
 
 import { strict as assert } from "node:assert"
 import { computeWindow, clampOffset, totalHeight, estimateMsgHeight, estimateMarkdownHeight } from "../src/ui/viewport.tsx"
 import { COMMANDS, LEADER_KEYS, matchCommands, helpLines, transcriptName } from "../src/commands.ts"
-import { extractAtRefs, scoreMatch, resolveRefs, matchAtCompletion, getFileIndex } from "../src/refs.ts"
-import { normalizeSpec } from "../src/influx/plan-runner.ts"
+import { parseMouseSeq, createMouseFilterStdin } from "../src/ui/mouse.tsx"
+import { Readable } from "node:stream"
 
 let pass = 0
 let fail = 0
@@ -28,7 +28,8 @@ check("computeWindow 窗口切片(超长内容贴底)", () => {
   const w = computeWindow(heights, 8, 12)
   assert.equal(w.start, 3)
   assert.ok(w.startPad >= 0 && w.startPad < heights[3]!)
-  assert.ok(w.visibleH <= 8 - w.startPad)
+  assert.ok(w.visibleH <= 8) // 裁剪后渲染行数不超过视口
+  assert.ok(w.endClip >= 0)
 })
 
 check("computeWindow 短内容不滚动", () => {
@@ -58,11 +59,41 @@ check("estimateMsgHeight user 头部+正文", () => {
   assert.equal(estimateMsgHeight(m, 40), 2)
 })
 
+// ---------- 滚动回归: 活动区与消息同属一个滚动文档(修复"流式时历史消息消失/无法回滚") ----------
+// 旧实现: 活动区(liveH)从视口里扣掉, 流式一长消息区只剩 1 行且钉死的活动区挡在前面,
+// 上滚也回不到历史。新实现: 消息+活动区拼成同一个 heights, 视口不缩水。
+
+check("滚动文档: 长流式段不压缩消息区视口", () => {
+  const msgHeights = [2, 3, 4, 5] // 历史消息
+  const liveH = 50 // 超长流式输出(旧实现会把它扣成 viewportRows-1, 消息区仅剩 1 行)
+  const segHeights = [...msgHeights, 1 + liveH]
+  const viewport = 30
+  // 贴底(lockBottom)时窗口从尾部切, 但 offset 可以回到 0 → 历史永远可寻回
+  const bottom = computeWindow(segHeights, viewport, totalHeight(segHeights) - viewport)
+  assert.ok(bottom.start > msgHeights.length - 1) // 贴底显示在活动区
+  const top = computeWindow(segHeights, viewport, 0)
+  assert.equal(top.start, 0) // 上滚回顶部 → 第一条消息可见
+  assert.ok(top.end >= msgHeights.length) // 历史消息全部在窗口内(尾部被切到的活动区块也包含)
+})
+
+check("滚动文档: 上滚可越过活动区看到全部历史", () => {
+  const msgHeights = [2, 3, 4, 5, 6]
+  const segHeights = [...msgHeights, 4]
+  const viewport = 8
+  // 旧实现 viewH = viewport - liveH(4) = 4, 活动区永远占满底部, 上滚窗口只有 4 行
+  // 新实现 viewH = viewport = 8, 活动区是文档尾部, 上滚后滚出视口
+  const mid = computeWindow(segHeights, viewport, 6) // 滚到中间
+  assert.equal(mid.start, 2)
+  assert.ok(mid.end <= msgHeights.length) // 活动区滚出视口, 只显示历史消息
+  const top = computeWindow(segHeights, viewport, 0)
+  assert.equal(top.start, 0)
+})
+
 // ---------- commands ----------
 
 check("matchCommands 前缀匹配", () => {
-  const c = matchCommands("/pl")
-  assert.ok(c.some((x) => x.name === "plan"))
+  const c = matchCommands("/sess")
+  assert.ok(c.some((x) => x.name === "sessions"))
   assert.equal(matchCommands("普通文本").length, 0)
 })
 
@@ -72,9 +103,11 @@ check("matchCommands 别名", () => {
 })
 
 check("LEADER_KEYS 映射完整", () => {
-  for (const k of ["u", "r", "n", "l", "t", "m", "e", "c", "d", "q"]) {
+  for (const k of ["n", "l", "t", "m", "e", "x", "c", "v", "d", "p", "q"]) {
     assert.ok(LEADER_KEYS[k], `leader key ${k}`)
   }
+  assert.equal(LEADER_KEYS.c, "copy")
+  assert.equal(LEADER_KEYS.v, "copyq")
   assert.ok(helpLines().length >= COMMANDS.length)
 })
 
@@ -82,73 +115,33 @@ check("transcriptName 时间戳格式", () => {
   assert.match(transcriptName(), /^transcript-\d{8}-\d{6}\.md$/)
 })
 
-// ---------- refs ----------
+// ---------- 鼠标代理(SGR 剥离, 修复"点击往输入框打 [<0;12;34M") ----------
 
-check("extractAtRefs", () => {
-  assert.deepEqual(extractAtRefs("看下 @src/foo.ts 和 @bar.ts"), ["src/foo.ts", "bar.ts"])
-  assert.deepEqual(extractAtRefs("没有引用"), [])
+check("parseMouseSeq SGR 按下/释放/滚轮", () => {
+  const press = parseMouseSeq("\x1b[<0;12;34M")!
+  assert.deepEqual({ button: press.button, row: press.row, col: press.col }, { button: 0, row: 12, col: 34 })
+  assert.equal(parseMouseSeq("\x1b[<0;12;34m"), null, "释放事件应忽略")
+  assert.equal(parseMouseSeq("\x1b[<64;5;10M")!.button, 64)
+  assert.equal(parseMouseSeq("\x1b[<65;5;10M")!.button, 65)
 })
 
-check("scoreMatch 前缀加分/子序列", () => {
-  assert.ok(scoreMatch("app.tsx", "app") > scoreMatch("src/happ.ts", "app"))
-  assert.equal(scoreMatch("abc", "xyz"), -1)
-})
-
-check("resolveRefs 直接路径注入内容", async () => {
-  const fs = await import("node:fs")
-  const { mkdtempSync } = await import("node:fs")
-  const dir = mkdtempSync("/tmp/minicode-refs-")
-  fs.writeFileSync(`${dir}/hello.md`, "引用内容", "utf8")
-  const r = await resolveRefs(dir, "读 @hello.md 然后总结")
-  assert.equal(r.text, "读 hello.md 然后总结")
-  assert.equal(r.refs.length, 1)
-  assert.ok(r.refs[0]!.content.includes("引用内容"))
-})
-
-check("matchAtCompletion 命中未追踪文件(glob 兜底)", async () => {
-  const fs = await import("node:fs")
-  const { mkdtempSync } = await import("node:fs")
-  const dir = mkdtempSync("/tmp/minicode-at-")
-  fs.writeFileSync(`${dir}/target-api.ts`, "x", "utf8")
-  fs.mkdirSync(`${dir}/sub`)
-  fs.writeFileSync(`${dir}/sub/target-helper.ts`, "x", "utf8")
-  const r = await matchAtCompletion(dir, "target-api")
-  assert.ok(r.includes("target-api.ts"), `候选含 target-api.ts: ${r.join(",")}`)
-  const idx = await getFileIndex(dir)
-  assert.ok(idx.includes("sub/target-helper.ts"), "索引含子目录文件")
-})
-
-// ---------- 声明归一化(shell 参数名漂移容错) ----------
-
-check("normalizeSpec shell 参数名漂移 → cmd", () => {
-  const s = normalizeSpec({ type: "flow", children: [{ type: "task", key: "a", tool: "shell", params: { command: "npm test" } }] }) as any
-  assert.equal(s.children[0].params.cmd, "npm test")
-})
-
-check("normalizeSpec script/cmdline 别名", () => {
-  const a = normalizeSpec({ type: "task", key: "b", tool: "shell", params: { script: "echo hi" } }) as any
-  assert.equal(a.params.cmd, "echo hi")
-  const c = normalizeSpec({ type: "task", key: "c", tool: "shell", params: { cmdline: "ls" } }) as any
-  assert.equal(c.params.cmd, "ls")
-})
-
-check("normalizeSpec 空 cmd 回退别名", () => {
-  const s = normalizeSpec({ type: "task", key: "a", tool: "shell", params: { cmd: "", command: "echo ok" } }) as any
-  assert.equal(s.params.cmd, "echo ok")
-  const n = normalizeSpec({ type: "task", key: "b", tool: "shell", params: { cmd: "", script: "" } }) as any
-  assert.equal(n.params.cmd, "") // 别名也空 → 保持原样, 交给工具报错
-})
-
-check("normalizeSpec 不改正确参数与嵌套", () => {
-  const s = normalizeSpec({
-    type: "flow",
-    children: [
-      { type: "task", key: "ok", tool: "shell", params: { cmd: "echo ok" } },
-      { type: "flow", children: [{ type: "task", key: "d", tool: "http.get", params: { uri: "https://x" } }] },
-    ],
-  }) as any
-  assert.equal(s.children[0].params.cmd, "echo ok")
-  assert.equal(s.children[1].children[0].params.url, "https://x")
+check("鼠标代理: 剥离鼠标序列, 文本/方向键原样转发, 跨 chunk 重组", async () => {
+  const input = new Readable({ read() {} })
+  const mouseEvents: string[] = []
+  const created = createMouseFilterStdin(input as any, () => {})
+  created.bus.on((e) => mouseEvents.push(`m:${e.button}@${e.row},${e.col}`))
+  let inkGot = ""
+  created.stdin.on("data", (d: Buffer) => (inkGot += d.toString()))
+  // 分块投喂: 鼠标序列拆成 2 块 + 文本 + 方向键
+  input.push("\x1b[<0;5;6M")
+  input.push("hello")
+  input.push("\x1b[<1")
+  input.push(";7;8M")
+  input.push("\x1b[A")
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(inkGot, "hello\x1b[A", "ink 只应收到文本与方向键, 不收到鼠标序列")
+  assert.equal(mouseEvents.length, 2)
+  assert.ok(mouseEvents[0]!.startsWith("m:0@5,6") && mouseEvents[1]!.startsWith("m:1@7,8"))
 })
 
 // ---------- 收尾 ----------

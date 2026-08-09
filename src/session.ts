@@ -1,26 +1,25 @@
 // 会话持久化 —— 对齐 opencode 的会话管理基础能力
 //
-// 对话(结构化消息 + LLM 历史)落盘到 ~/.minicode/sessions/,
+// 对话(结构化消息 + LLM 历史)落盘到 <项目>.minicode/sessions/(MINICODE_HOME 可覆盖),
 // 支持: 列表查看 / 按序号恢复 / 启动 --resume 自动恢复最近会话。
-// 文件: {ts}-{slug}.json, 内容 {cwd, model, mode, createdAt, msgs, history}
+// 文件: {ts}-{slug}.json, 内容 {cwd, model, createdAt, msgs, history}
 
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs"
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import { homedir } from "node:os"
-import type { ChatMsg } from "./types.ts"
+import type { ChatMsg, ChatMessage } from "./types.ts"
+import { sessionsDir as resolveSessionsDir } from "./paths.ts"
 
 export interface SessionRecord {
   id: string
   cwd: string
   model: string
-  mode: "plan" | "build"
   createdAt: number
   msgs: ChatMsg[]
-  history: import("./types.ts").ChatMessage[]
+  history: ChatMessage[]
 }
 
 function sessionsDir(): string {
-  return join(homedir(), ".minicode", "sessions")
+  return resolveSessionsDir()
 }
 
 function slug(cwd: string): string {

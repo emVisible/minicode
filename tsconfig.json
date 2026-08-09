@@ -15,6 +15,5 @@
     "forceConsistentCasingInFileNames": true,
     "jsx": "preserve"
   },
-  "include": ["src", "test"],
-  "exclude": ["examples", "src/influx/jsx.d.ts"]
+  "include": ["src", "test"]
 }

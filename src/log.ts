@@ -10,7 +10,7 @@
 
 import { appendFileSync, readFileSync, renameSync, statSync, mkdirSync } from "node:fs"
 import { join } from "node:path"
-import { homedir } from "node:os"
+import { logsDir } from "./paths.ts"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -25,7 +25,7 @@ function resolveLevel(): LogLevel {
 const MAX_FILE_BYTES = 2 * 1024 * 1024
 
 function logDir(): string {
-  return join(homedir(), ".minicode", "logs")
+  return logsDir()
 }
 
 function todayFile(): string {

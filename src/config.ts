@@ -1,37 +1,40 @@
-// 用户配置 —— ~/.minicode/config.json(可用 MINICODE_CONFIG 覆盖路径)
+// 用户配置 —— <项目>.minicode/config.json(可用 MINICODE_HOME 覆盖根目录, MINICODE_CONFIG 覆盖文件)
 //   - 加载防御式: 文件损坏/不存在时回退空配置, 不崩溃(技术宪章 17.3/17.4)
 //   - 保存原子写: 先写临时文件再 rename(17.11)
 //   - 密钥文件权限 0600(8.2)
 //   - 生效优先级: 环境变量 > 配置文件(配置只填充未设置的环境变量)
 //
-// 测试隔离(实践第三十四节): 测试通过 MINICODE_CONFIG 指向临时文件, 与生产读取链完全一致
+// 测试隔离: 测试通过 MINICODE_HOME 指向临时目录, 与生产读取链完全一致
 
-import { homedir } from "node:os"
 import { join, dirname } from "node:path"
 import { mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from "node:fs"
+import { configFile } from "./paths.ts"
 
 export interface MinicodeConfig {
   llmUrl?: string
   llmApiKey?: string
   llmModel?: string
+  /** 主题外观(dark/light), 设置面板切换后持久化 */
+  theme?: "dark" | "light"
+  /** 紧凑消息间距 */
+  dense?: boolean
 }
 
-const CONFIG_DIR = join(homedir(), ".minicode")
-const DEFAULT_PATH = join(CONFIG_DIR, "config.json")
-
-export function configPath(): string {
-  return process.env.MINICODE_CONFIG || DEFAULT_PATH
+export function configPath(cwd?: string): string {
+  return process.env.MINICODE_CONFIG || configFile(cwd)
 }
 
 /** 防御式加载: 任何异常(不存在/损坏/非法 JSON)都回退空配置 */
-export function loadConfig(): MinicodeConfig {
-  const path = configPath()
+export function loadConfig(cwd?: string): MinicodeConfig {
+  const path = configPath(cwd)
   try {
     const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>
     const out: MinicodeConfig = {}
     if (typeof raw.llmUrl === "string" && raw.llmUrl.trim()) out.llmUrl = raw.llmUrl.trim()
     if (typeof raw.llmApiKey === "string" && raw.llmApiKey.trim()) out.llmApiKey = raw.llmApiKey.trim()
     if (typeof raw.llmModel === "string" && raw.llmModel.trim()) out.llmModel = raw.llmModel.trim()
+    if (raw.theme === "dark" || raw.theme === "light") out.theme = raw.theme
+    if (typeof raw.dense === "boolean") out.dense = raw.dense
     return out
   } catch {
     return {}
@@ -39,8 +42,8 @@ export function loadConfig(): MinicodeConfig {
 }
 
 /** 原子写: 临时文件 + rename, 避免半写状态; 密钥文件 0600 */
-export function saveConfig(cfg: MinicodeConfig): void {
-  const path = configPath()
+export function saveConfig(cfg: MinicodeConfig, cwd?: string): void {
+  const path = configPath(cwd)
   const tmp = path + ".tmp"
   mkdirSync(dirname(path), { recursive: true })
   const body = JSON.stringify(cfg, null, 2) + "\n"

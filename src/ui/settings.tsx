@@ -22,7 +22,8 @@ export function SettingsPanel(props: {
   const { draft, field, t, onChange } = props
 
   const displayValue = (f: (typeof FIELDS)[number]): string => {
-    const v = draft[f.key] ?? ""
+    const raw = draft[f.key]
+    const v = typeof raw === "string" ? raw : ""
     if (!v) return ""
     if (f.secret && v.length > 8) return `••••••••${v.slice(-4)}`
     return v
@@ -46,7 +47,7 @@ export function SettingsPanel(props: {
               </Box>
               {active ? (
                 <Input
-                  value={draft[f.key] ?? ""}
+                  value={typeof draft[f.key] === "string" ? (draft[f.key] as string) : ""}
                   focus
                   t={t}
                   placeholder={f.placeholder}

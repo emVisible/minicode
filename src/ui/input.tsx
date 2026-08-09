@@ -8,8 +8,9 @@
 
 import React, { useEffect, useRef, useState } from "react"
 import type { ReactNode } from "react"
-import { Box, Text, useInput } from "ink"
+import { Box, Text, useInput, useCursor, useStdout } from "ink"
 import type { ThemeTokens } from "./theme.ts"
+import { displayWidth } from "./markdown.tsx"
 
 export function Input({
   value,
@@ -18,6 +19,7 @@ export function Input({
   placeholder,
   focus = true,
   t,
+  realCaret,
 }: {
   value: string
   onChange: (v: string) => void
@@ -25,6 +27,8 @@ export function Input({
   placeholder?: string
   focus?: boolean
   t: ThemeTokens
+  /** 真实终端光标(供中文输入法组合条锚定): base=首列(1 基), wrap=换行宽 */
+  realCaret?: { base: number; wrap: number }
 }): ReactNode {
   // ---- 同步镜像: 事件处理器永远读到最新值, 不依赖渲染节奏 ----
   const valueRef = useRef(value)
@@ -109,6 +113,24 @@ export function Input({
   const cur = chars[cursor]
   const rest = chars.slice(cursor + 1).join("")
 
+  // 真实光标: 固定在输入区首行(与 Input 同帧的最底行), 列随光标位置——
+  // 否则中文输入法的组合条/候选窗会漂到终端角落或别处。
+  // 坐标系: Ink 的 (x, y) 是 0 基且光标落在最终帧的最底行, 传 1 基会整体错位一行/一列
+  const { stdout } = useStdout()
+  const { setCursorPosition } = useCursor()
+  const cols = stdout.columns ?? 80
+  const rows = stdout.rows ?? 24
+  const wrap = realCaret?.wrap ?? Math.max(1, cols - 4 - (realCaret?.base ?? 0))
+  const lineCol = displayWidth(shown) % Math.max(1, wrap)
+  setCursorPosition(
+    focus && realCaret
+      ? {
+          x: Math.min(Math.max(0, cols), Math.max(0, realCaret.base - 1 + lineCol)),
+          y: Math.max(0, rows - 3 - Math.floor(displayWidth(shown) / Math.max(1, wrap))),
+        }
+      : undefined
+  )
+
   return (
     <Box flexGrow={1} flexDirection="column">
       {value.length === 0 && placeholder ? (
@@ -118,7 +140,7 @@ export function Input({
       ) : (
         <Text wrap="wrap">
           {shown}
-          {focus ? <Text inverse>{cur || " "}</Text> : cur}
+          {focus && !realCaret ? <Text inverse>{cur || " "}</Text> : cur}
           {rest}
         </Text>
       )}

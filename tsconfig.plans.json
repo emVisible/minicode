@@ -1,8 +1,0 @@
-{
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "jsx": "preserve"
-  },
-  "include": ["examples/**/*.tsx", "src/influx/jsx.d.ts", "src/influx/core.ts", "src/influx/tools.ts"],
-  "exclude": ["src", "test", "node_modules"]
-}

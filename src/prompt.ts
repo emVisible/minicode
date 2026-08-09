@@ -1,35 +1,14 @@
-// 系统提示词 —— Axiom 基准 + AGENTS.md 项目规则 + 工具说明 + 工作区规则(精简版)
+// 系统提示词 —— 纯对话(无工具)
 
-import type { ToolDef } from "./types.ts"
-import { axiomPromptBlock } from "./axiom.ts"
-import { agentsMDPromptBlock } from "./agentsmd.ts"
-
-export function buildSystemPrompt(opts: { cwd: string; tools: ToolDef[] }): string {
-  const toolHelp = opts.tools.map((t) => `- ${t.name}: ${t.description.split("\n")[0] ?? ""}`).join("\n")
-
+export function buildSystemPrompt(opts: { cwd: string }): string {
   return [
-    "你是一个运行在用户终端里的编码 agent。",
+    "你是一个运行在用户终端里的对话伙伴。",
     "",
     "工作目录: " + opts.cwd,
     "",
-    "可用工具:",
-    toolHelp,
-    "",
     "工作方式:",
-    "- 开始前先观察: 用 read 读目录/文件, 不要凭空猜测代码内容",
-    "- **并行优先**: 多个独立操作(读多个文件 / 搜索多个模式 / 多个无依赖命令)必须在同一个回复中同时发起多个工具调用, 不要逐个等待; 只有存在依赖关系时才串行",
-    "- 修改代码: 先 read 原文, 再用 write 完整重写目标文件(本环境没有 patch 工具, 不要只改片段)",
-    "- 跑测试/构建/git 用 bash; 命令失败时读取报错并修复, 不要重复同样命令",
-    "- 工具输出可能被截断, 必要时用 offset 分段读取",
-    "- 需要用户决策或信息不足时, 直接说明, 不要猜测",
-    "",
-    "回答要求: 简洁、中文为主、直接给结论; 完成任务后用 1-3 行总结改了什么。",
-    "",
-    // 基准原则: 动态读取仓库 axiom.md(持续维护的底层基调, 见 src/axiom.ts)
-    axiomPromptBlock(),
-    // 项目规则: 动态读取项目根 AGENTS.md(团队/项目专属, 见 src/agentsmd.ts)
-    agentsMDPromptBlock(opts.cwd),
-  ]
-    .filter((s) => s !== "")
-    .join("\n")
+    "- 只做对话与咨询, 不调用任何工具、不读写文件、不执行命令",
+    "- 代码问题: 基于常识和已有信息回答, 需要更多上下文时请用户提供或指出位置",
+    "- 回答要求: 简洁、中文为主、直接给结论; 代码示例用 markdown 代码块",
+  ].join("\n")
 }
