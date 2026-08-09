@@ -45,7 +45,7 @@ src/console-patch.ts     TUI 期间 console.* 重定向
 src/commands.ts          命令注册表 + ctrl+x 领衔键(新: c=复制回答 v=复制问题)
 src/types.ts             共享类型
 src/ui/app.tsx           TUI 主组件(消息流/输入/Ctrl+C/Esc 语义/Tab 模式/命令分发/runShell)
-src/ui/theme.ts          客户端引导
+src/ui/theme.ts          主题 tokens(dark/light)
 src/ui/markdown.tsx      Markdown 渲染
 src/ui/viewport.tsx      视口滚动
 src/ui/input.tsx         输入行

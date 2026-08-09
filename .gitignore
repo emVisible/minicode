@@ -2,7 +2,5 @@ node_modules/
 *.tsbuildinfo
 .out/
 .env
-issues.md
-project_optimization_suggestions.md
 dist/
 .minicode/

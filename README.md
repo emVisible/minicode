@@ -21,6 +21,9 @@ Mini opencode: 一个终端里的对话式 LLM 聊天工具。核心链路(LLM S
 - **剪贴板复制**(`src/clipboard.ts`): mac pbcopy / win clip / linux xclip-xsel 自动适配
 - **独立配置面板**(`Ctrl+o` / `/config`): URL/Key/Model 三字段表单, 保存即生效(直接覆写进程 env)
 - **首启引导**: 未配置 LLM 连接时自动打开配置面板, 无需记命令行
+- **聊天气泡**: 我的消息右对齐气泡(宽度随内容自适应), 回答左对齐; `/dense` 切换紧凑/宽松间距(持久化)
+- **长输入预览**: 输入过长时自动弹独立预览窗(Enter 确认发送 · Esc 收起继续编辑)
+- **IME 光标**: 真实终端光标钉在输入位(useCursor), 中文输入法组合条不漂移; `/themes` 主题切换持久化到配置
 
 ### 项目内缓存
 
@@ -98,6 +101,6 @@ pnpm typecheck && pnpm smoke && pnpm smoke:ui && pnpm smoke:tui
 
 ## 未实现(明确不做/后续)
 
-- 工具调用(read/write/bash/webfetch)—— 设计上就是纯聊天,永不引入
+- 工具调用(read/write/bash 等)—— 设计上就是纯聊天,永不引入
 - 上下文语义压缩(当前仅 LLM 摘要)
 - 多 provider 协议(non-OpenAI)/图片输入
