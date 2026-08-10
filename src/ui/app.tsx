@@ -17,7 +17,7 @@ import { createLLMClient } from "../llm.ts"
 import { saveConfig, loadConfig, applyConfigToEnv, configPath, activeProvider, listProviders, switchProvider, saveProviderProfile, registerForcedEnv, resetForcedEnv, DEFAULT_PROVIDER } from "../config.ts"
 import { log, logPath, logTail } from "../log.ts"
 import { saveSession, renameSession, forkSession, deleteSession, listSessions, loadSession, newSessionId, latestSession, sessionsDirPath } from "../session.ts"
-import { recordUsage, usageDetailLines } from "../usage.ts"
+import { recordUsage, usageDetailLines, flushUsage } from "../usage.ts"
 import { copyToClipboard } from "../clipboard.ts"
 import { SettingsPanel } from "./settings.tsx"
 import { Input } from "./input.tsx"
@@ -537,8 +537,8 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
   }
   /** 面板命令执行(名字 = COMMANDS[].name; 无匹配回退到时序分发表) */
   function runPaletteCommand(name: string): void {
-    if (busy && name !== "help" && name !== "sessions") {
-      // 运行中执行 new/compact/quit 等会打断流式状态; 只允许查看类的 help/sessions
+    if (busy && !["help", "sessions", "usage", "models", "log"].includes(name)) {
+      // 运行中执行 new/compact/quit 等会打断流式状态; 只允许查看类的命令
       closePalette()
       pushMsg({ kind: "info", text: "运行中: 先按 Esc / Ctrl+C 中断, 再执行该命令", ts: Date.now() })
       return
@@ -762,6 +762,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       pushMsg({ kind: "info", text: `上下文尚短(${hist.length} 条), 无需压缩`, ts: Date.now() })
       return
     }
+    const t0 = Date.now()
     pushMsg({ kind: "info", text: "正在压缩上下文…", ts: Date.now() })
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 60_000)
@@ -786,7 +787,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
         model: modelName,
         inputTokens: res.usage.inputTokens,
         outputTokens: res.usage.outputTokens,
-        latencyMs: 0,
+        latencyMs: Date.now() - t0,
       })
       void res
       const clean = summary.trim().slice(0, 1000)
@@ -794,7 +795,8 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
         { role: "user", content: "(上下文已压缩, 以下是此前的会话摘要)" },
         { role: "assistant", content: `[上下文摘要]\n${clean}` },
       ]
-      pushMsg({ kind: "verdict", ok: true, text: "上下文已压缩", detail: [clean.slice(0, 400)], ts: Date.now() })
+      const usageLine = res.usage.totalTokens > 0 ? `↑${res.usage.inputTokens} ↓${res.usage.outputTokens} · ${((Date.now() - t0) / 1000).toFixed(1)}s` : undefined
+      pushMsg({ kind: "verdict", ok: true, text: "上下文已压缩", detail: usageLine ? [usageLine, clean.slice(0, 400)] : [clean.slice(0, 400)], ts: Date.now() })
       log.info("tui", "/compact 完成", { from: hist.length, to: 2 })
     } catch (e) {
       pushMsg({ kind: "danger", text: `压缩失败: ${e instanceof Error ? e.message : String(e)}`, ts: Date.now() })
@@ -812,6 +814,11 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
   const shellAllowAllRef = useRef(false)
 
   function dispatchLeader(action: string): void {
+    // busy 时只放行查看类; new/fork/quit/provider 会打断流式状态或改配置, 先中断再说
+    if (busy && ["new", "fork", "quit", "provider"].includes(action)) {
+      pushMsg({ kind: "info", text: "运行中: 先按 Esc / Ctrl+C 中断, 再执行该操作", ts: Date.now() })
+      return
+    }
     const actions: Record<string, () => void> = {
       new: () => {
         flushSession.current()
@@ -832,6 +839,9 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
           ts: Date.now(),
         })
       },
+      usage: () => pushMsg({ kind: "info", text: "用量统计:", detail: usageDetailLines(sessionIdRef.current), ts: Date.now() }),
+      fork: () => forkCurrentSession(),
+      provider: () => applyProviderCommand(""),
       export: () => void exportTranscript(),
       editor: () => void composeInEditor(),
       copy: () => copyMsg("assistant", "回答"),
@@ -858,6 +868,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     l.timer = setTimeout(clearLeader, LEADER_TIMEOUT_MS)
   }
   function exitConfirmed(): void {
+    flushUsage()
     flushSession.current()
     exit()
   }

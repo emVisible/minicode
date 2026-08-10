@@ -16,7 +16,8 @@ export const DANGER_RULES: readonly DangerRule[] = [
   { id: "disk-destroy", pattern: /(mkfs[.\w]*|diskutil eraseDisk|dd[^;]*of=\/dev\/|umount[^;]*\/dev\/|fdisk[^;]*\/dev\/)/i, hint: "磁盘/分区级操作" },
   { id: "power", pattern: /(^|[\s;|&])(shutdown|reboot|poweroff|halt|init\s+0)(\s|$)/, hint: "关机/重启" },
   { id: "git-push-force", pattern: /git push[^;]*(-f|--force)/i, hint: "强制推送覆盖远端历史" },
-  { id: "pipe-shell", pattern: /(curl|wget)[^|;]*\|\s*(sh|bash)\b/i, hint: "管道执行远端脚本" },
+  { id: "pipe-shell", pattern: /(curl|wget)[^|;]*\|\s*(sudo\s+)?(sh|bash|zsh|fish)\b/i, hint: "管道执行远端脚本" },
+  { id: "eval-remote", pattern: /\beval\s*(\(|"|\$|')\s*(\$|"|')?\s*\(\s*(curl|wget)/i, hint: "eval 取远端命令输出执行" },
   { id: "dev-write", pattern: /(^|\s)(echo|printf)[^>]*>\s*\/dev\//, hint: "直接写设备文件" },
   { id: "chmod-root", pattern: /chmod -R 777 (\/|~|\$HOME)/i, hint: "根目录/家目录全局放开权限" },
 ]

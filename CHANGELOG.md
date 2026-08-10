@@ -9,6 +9,7 @@
 - **`/provider`**: 无参列出全部 provider 与当前项; 带参创建(必要时)并切换, 立即重算进程 env(用户自设 env 恒优, 本模块注入的 env 在切换时撤销); 设置面板页头显示当前 provider, 保存写入当前快照; 头部模型标签在非 default 时显示 `provider · model`
 - **headless**: `--provider <名字>` 指定快照(映射为 LLM_PROVIDER, 不改写配置); `--json` 单对象输出 `{ok, finish, text, model, sessionId, inputTokens, outputTokens, latencyMs}`; `--stream-json` NDJSON 逐事件 `delta/usage/done`; 退出码: 0 成功 / 1 失败(网络/重试耗尽) / 2 配置缺失(未设置 LLM_URL)
 - 门禁: `pnpm smoke(39· 新增 provider 快照与 headless 结构化断言) && pnpm smoke:ui(18) && pnpm smoke:tui(13)` 全绿
+- **查漏补缺**: 领衔键补全 `u`/usage · `f`/fork · `o`/provider; busy 时面板/领衔键只放行查看类命令(usage/models/log/help/sessions); /compact verdict 附用量行; 危险规则补 `sudo sh/bash/zsh/fish` 管道与 `eval $(curl|wget)`; 退出路径统一 `flushUsage()`(headless 防抖丢失修复)
 
 ### 2026-08-09 v0.6.3 用量统计与危险命令闸门
 - **用量统计** `src/usage.ts`: 自动按会话记录 token / 轮次 / 首字耗时, 落盘 `<home>/usage.json`(会话 + 按天聚合, 300ms 防抖); 每次回答 verdict 行附 `↑in ↓out · 耗时` 一次链路耗时; **`/usage`** 展示 本会话/今日/累计 三行(命令面板内搜 usage 也可); TUI 与 headless(`--resume` 归属原会话)都记录

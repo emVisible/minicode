@@ -83,7 +83,7 @@ test/tui-e2e.ts          PTY e2e(13)
 - [x] v0.6.1(08-09): 命令面板(Ctrl+P / "/" 呼出, 全部命令单一来源 `src/commands.ts`, 会话恢复入面板); 界面静默化(无操作提示推送); 移除 welcome.tsx
 - [x] v0.6.2(08-09): 会话治理 —— 面板 sessions 阶段 `d` 删除(二次确认, 当前会话禁止)/`r` 重命名(title 字段); `/fork` 复制当前会话为分支; headless `--resume[=<id>]` 续问并落回原会话
 - [x] v0.6.3(08-09): 用量统计(usage.json 会话/按天, /usage, verdict 附带用量) + 危险命令闸门(静态规则 + 单键确认 [y]/[a]/[Esc])
-- [x] v0.6.4(08-10): 多 provider 快照(`/provider` 切换/创建, --provider, env 优先级与强制撤销) + headless 结构化输出(--json/--stream-json, 退出码 0/1/2)
+- [x] v0.6.4(08-10): 多 provider 快照(`/provider` 切换/创建, --provider, env 优先级与强制撤销) + headless 结构化输出(--json/--stream-json, 退出码 0/1/2); 查漏补缺 —— 领衔键 u/f/o、busy 只读清单、compact 用量行、danger sudo/zsh/eval 补强、退出 flushUsage
 
 ### P0 — 稳定
 - [ ] 真实 LLM 端到端人工验证

@@ -7,7 +7,7 @@ import { createLLMClient } from "./llm.ts"
 import { buildSystemPrompt } from "./prompt.ts"
 import { loadConfig, applyConfigToEnv } from "./config.ts"
 import { saveSession, loadSession, latestSession } from "./session.ts"
-import { recordUsage } from "./usage.ts"
+import { recordUsage, flushUsage } from "./usage.ts"
 import { log, installCrashHandlers, logSessionStart, logSessionEnd } from "./log.ts"
 import { homePath, ensureHome, configFile } from "./paths.ts"
 
@@ -132,6 +132,8 @@ async function main(): Promise<void> {
   installCrashHandlers()
   logSessionStart(process.argv.slice(2), process.cwd())
   const exitCode = await runMain()
+  // 用量账本防抖 300ms, process.exit 前必须落盘, 否则最后一次记录丢失
+  flushUsage()
   logSessionEnd(exitCode)
   process.exit(exitCode)
 }

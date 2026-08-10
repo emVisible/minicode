@@ -20,7 +20,7 @@ Mini opencode: 一个终端里的对话式 LLM 聊天工具。核心链路(LLM S
 - **Tab 切换 对话/命令行 模式**: 命令行模式输入直接作为 shell 命令执行(`cwd` 运行, 30s 超时熔断, 输出回显为结论块); 自动阻止"在命令行模式里再起 minicode"的嵌套
 - **危险命令闸门**(`src/danger.ts`): 命令行模式先静态检查 —— rm 根/家目录、.git/.minicode 删除、管道执行远端脚本、git push --force、磁盘级操作、关机重启等命中时**不执行**, 弹单键确认 `y` 执行一次 · `a` 本会话放行 · `Esc` 取消
 - **用量统计**(`src/usage.ts`): 自动按会话/按天记录 token 与轮次(落盘 `.minicode/usage.json`); 每次回答 verdict 附 `↑in ↓out · 耗时`; `/usage` 展示 本会话/今日/累计
-- **Ctrl+x 领衔快捷键**(静默执行, 全表见命令面板): `n`新会话 `l`会话列表 `t`主题 `m`模型 `e`编辑器 `c`复制最后回答 `v`复制我的问题 `x`导出 `d`诊断 `p`帮助 `q`退出
+- **Ctrl+x 领衔快捷键**(静默执行, 全表见命令面板): `n`新会话 `l`会话列表 `t`主题 `m`模型 `e`编辑器 `c`复制最后回答 `v`复制我的问题 `x`导出 `d`诊断 `g`间距 `u`用量 `f`分支 `o`provider `p`帮助 `q`退出
 - **提示静默**: 常规界面上不再推送操作提示(模式切换/取消/Esc 等均为静默操作), 需要查询一律进命令面板
 - **剪贴板复制**(`src/clipboard.ts`): mac pbcopy / win clip / linux xclip-xsel 自动适配
 - **独立配置面板**(`Ctrl+o` / `/config`): URL/Key/Model 三字段表单, 保存即生效(直接覆写进程 env)
