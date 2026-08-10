@@ -14,20 +14,22 @@ import { basename, join } from "node:path"
 import { spawn, execFile } from "node:child_process"
 import { buildSystemPrompt } from "../prompt.ts"
 import { createLLMClient } from "../llm.ts"
-import { saveConfig, loadConfig, applyConfigToEnv, configPath } from "../config.ts"
+import { saveConfig, loadConfig, applyConfigToEnv, configPath, activeProvider, listProviders, switchProvider, saveProviderProfile, registerForcedEnv, resetForcedEnv, DEFAULT_PROVIDER } from "../config.ts"
 import { log, logPath, logTail } from "../log.ts"
-import { saveSession, listSessions, loadSession, newSessionId, latestSession, sessionsDirPath } from "../session.ts"
+import { saveSession, renameSession, forkSession, deleteSession, listSessions, loadSession, newSessionId, latestSession, sessionsDirPath } from "../session.ts"
+import { recordUsage, usageDetailLines } from "../usage.ts"
 import { copyToClipboard } from "../clipboard.ts"
 import { SettingsPanel } from "./settings.tsx"
 import { Input } from "./input.tsx"
+import { PalettePanel, type PaletteRow, type SessionRow } from "./palette.tsx"
 import { renderMarkdown, displayWidth } from "./markdown.tsx"
-import { WelcomeCard } from "./welcome.tsx"
 import { tokens, initialThemeName } from "./theme.ts"
 import type { ThemeTokens, ThemeName } from "./theme.ts"
 import type { MinicodeConfig } from "../config.ts"
 import type { ChatMsg, DiagLine } from "../types.ts"
 import { useTerminalSize, estimateMsgHeight, estimateMarkdownHeight, computeWindow, totalHeight, clampOffset, clipTextRows, clipTextRowsKeep, bubbleWidth } from "./viewport.tsx"
-import { COMMANDS, LEADER_KEYS, LEADER_TIMEOUT_MS, matchCommands, helpLines, transcriptName } from "../commands.ts"
+import { COMMANDS, LEADER_KEYS, LEADER_TIMEOUT_MS, paletteMatches, PALETTE_MAX_ROWS, transcriptName } from "../commands.ts"
+import { matchDanger } from "../danger.ts"
 
 // 渲染错误边界: ink 自带 ErrorBoundary 的 onError 会直接退出整个 TUI, 我们包自己的边界就地显示
 class AppErrorBoundary extends React.Component<{ children: ReactNode; onError?: (e: Error) => void }, { error: Error | null }> {
@@ -114,7 +116,6 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
   const historyRef = useRef<import("../types.ts").ChatMessage[]>([])
   const controllerRef = useRef<AbortController | null>(null)
   const sessionIdRef = useRef(newSessionId(cwd))
-  const pendingSessionsRef = useRef<Array<{ id: string; label: string }> | null>(null)
 
   // --resume: 启动时恢复最近一次会话
   useEffect(() => {
@@ -148,6 +149,17 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
   // 长输入预览窗: 输入过长时弹出独立查看/确认窗(Enter 确认发送, Esc 收起继续编辑)
   const [previewOpen, setPreviewOpen] = useState(false)
   const PREVIEW_LINES = 7
+  // ---------- 命令面板(Ctrl+P / 输入 "/" 打开; 全界面唯一的提示区) ----------
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [palettePhase, setPalettePhase] = useState<"commands" | "sessions">("commands")
+  const [paletteQuery, setPaletteQuery] = useState("")
+  const [paletteSel, setPaletteSel] = useState(0)
+  /** sessions 阶段: "browse" 浏览 / "rename" 输入新名字(Enter 提交, Esc 放弃) */
+  const [paletteMode, setPaletteMode] = useState<"browse" | "rename">("browse")
+  /** 删除二次确认: 记录上一个按 d 的目标, 再按才真删 */
+  const paletteDeleteIdRef = useRef<string | null>(null)
+  const paletteSessionsRef = useRef<Array<{ id: string; label: string; meta: string }>>([])
+  const paletteRestoreRef = useRef("")
   const scrollRef = useRef({ offset: 0, lock: true })
   scrollRef.current = { offset: scrollOffset, lock: scrollLock }
   const metricsRef = useRef({ viewportRows: 20, heights: [] as number[] })
@@ -277,18 +289,44 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     setConfigField(0)
     setSettingsOpen(true)
   }
-  function saveConfigPanel(): void {
-    const cfg: MinicodeConfig = {
-      llmUrl: configDraft.llmUrl?.trim() || undefined,
-      llmApiKey: configDraft.llmApiKey?.trim() || undefined,
-      llmModel: configDraft.llmModel?.trim() || undefined,
+  /** /provider: 无参列出全部 provider 与当前项; 带参则创建(必要时)并切换, 立即按新快照重算进程 env */
+  function applyProviderCommand(arg: string): void {
+    if (!arg) {
+      const { current, names } = listProviders()
+      pushMsg({
+        kind: "info",
+        text: `当前 provider: ${current}`,
+        detail: [...names.map((n) => `${n === current ? "→" : "  "} ${n}`), "切换: /provider <名字> · 环境变量 LLM_PROVIDER 可临时指定 · 编辑当前配置: /config"],
+        ts: Date.now(),
+      })
+      return
     }
-    saveConfig(cfg)
-    // 直接覆写进程内 env: applyConfigToEnv 只在 env 未设置时填充,
-    // 启动时已注入旧值 → 面板保存后必须强制更新, 否则"输入无效"
-    if (cfg.llmUrl) process.env.LLM_URL = cfg.llmUrl
-    if (cfg.llmApiKey) process.env.LLM_API_KEY = cfg.llmApiKey
-    if (cfg.llmModel) process.env.LLM_MODEL = cfg.llmModel
+    switchProvider(arg)
+    resetForcedEnv()
+    applyConfigToEnv(loadConfig())
+    const { current } = listProviders()
+    const { llmUrl, llmModel } = loadConfig()
+    pushMsg({
+      kind: "info",
+      text: `已切换 provider → ${current}`,
+      detail: [`url  = ${llmUrl ?? "(未配置, 请 /config 填写)"}`, `model = ${llmModel ?? "(沿用默认)"}`],
+      ts: Date.now(),
+    })
+  }
+
+  function saveConfigPanel(): void {
+    const prof = {
+      url: configDraft.llmUrl?.trim() || undefined,
+      apiKey: configDraft.llmApiKey?.trim() || undefined,
+      model: configDraft.llmModel?.trim() || undefined,
+    }
+    saveProviderProfile(prof)
+    if (prof.url) process.env.LLM_URL = prof.url
+    if (prof.apiKey) process.env.LLM_API_KEY = prof.apiKey
+    if (prof.model) process.env.LLM_MODEL = prof.model
+    if (prof.url) registerForcedEnv("LLM_URL")
+    if (prof.apiKey) registerForcedEnv("LLM_API_KEY")
+    if (prof.model) registerForcedEnv("LLM_MODEL")
     setSettingsOpen(false)
     setInput("")
     pushMsg({ kind: "info", text: `✓ 设置已保存并生效 (${configPath()})`, ts: Date.now() })
@@ -309,6 +347,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     setSpinnerTimer()
     const controller = new AbortController()
     controllerRef.current = controller
+    const t0 = Date.now()
     pushMsg({ kind: "user", text: display, ts: Date.now() })
     log.info("tui", "消息开始", { prompt: prompt.slice(0, 120) })
     historyRef.current = [...historyRef.current, { role: "user", content: prompt }]
@@ -336,12 +375,22 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       })
       commitStream()
       historyRef.current = [...historyRef.current, { role: "assistant", content: result.message.content }]
+      // 用量账本: 成功/失败都计一次往返(usage 可能全 0)
+      recordUsage({
+        sessionId: sessionIdRef.current,
+        model: modelName,
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        latencyMs: Date.now() - t0,
+      })
+      const usageLine =
+        result.usage.totalTokens > 0 ? `↑${result.usage.inputTokens} ↓${result.usage.outputTokens} · ${((Date.now() - t0) / 1000).toFixed(1)}s` : undefined
       if (result.finish === "aborted") {
         pushMsg({ kind: "danger", text: "已中断", ts: Date.now() })
       } else if (result.finish === "length" || result.finish === "content_filter" || result.finish === "error") {
         pushMsg({ kind: "danger", text: `回答被截断/终止 (finish=${result.finish})`, ts: Date.now() })
       } else {
-        pushMsg({ kind: "verdict", ok: true, text: "完成", ts: Date.now() })
+        pushMsg({ kind: "verdict", ok: true, text: "完成", detail: usageLine ? [usageLine] : undefined, ts: Date.now() })
       }
     } catch (e) {
       if (!controller.signal.aborted) pushMsg({ kind: "danger", text: e instanceof Error ? e.message : String(e), ts: Date.now() })
@@ -410,30 +459,127 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     setBusy(false)
   }
 
-  function submit(value: string): void {
-    const trimmed = value.trim()
-    // /sessions 列表恢复: 输入序号加载对应会话
-    if (pendingSessionsRef.current) {
-      const list = pendingSessionsRef.current
-      pendingSessionsRef.current = null
-      const n = parseInt(trimmed, 10)
-      const target = list[n - 1]
-      if (target) {
-        const rec = loadSession(target.id)
-        if (rec) {
-          sessionIdRef.current = rec.id
-          historyRef.current = rec.history
-          setMsgs(rec.msgs)
-          pushMsg({ kind: "info", text: `已恢复会话: ${target.label}`, ts: Date.now() })
-        } else {
-          pushMsg({ kind: "info", text: "会话加载失败", ts: Date.now() })
-        }
-      } else {
-        pushMsg({ kind: "info", text: "无效序号", ts: Date.now() })
-      }
-      setInput("")
+  // ---------- 命令面板 ----------
+  function refreshPaletteSessions(): void {
+    paletteSessionsRef.current = listSessions().map((s) => ({
+      id: s.id,
+      label: s.title ?? s.firstMsg,
+      meta: `${new Date(s.createdAt).toLocaleString()} · ${s.msgs} 条`,
+    }))
+    setPaletteSel((sel) => Math.min(sel, Math.max(0, paletteSessionsRef.current.length - 1)))
+  }
+  function openPalette(phase: "commands" | "sessions" = "commands", query = ""): void {
+    if (phase === "sessions") refreshPaletteSessions()
+    if (!paletteOpen) paletteRestoreRef.current = input // 记住打开前的草稿, 关闭时还回去
+    setPaletteMode("browse")
+    paletteDeleteIdRef.current = null
+    setPalettePhase(phase)
+    setPaletteQuery(query)
+    setPaletteSel(0)
+    setPaletteOpen(true)
+    setInput("")
+  }
+  function closePalette(): void {
+    setPaletteOpen(false)
+    setPaletteMode("browse")
+    paletteDeleteIdRef.current = null
+    setInput(paletteRestoreRef.current)
+  }
+  /** 提交重命名(输入框内容即新名字) */
+  function commitPaletteRename(): void {
+    const s = paletteSessionsRef.current[paletteSel]
+    if (s) {
+      renameSession(s.id, paletteQuery)
+      refreshPaletteSessions()
+    }
+    setPaletteMode("browse")
+  }
+  /** 把当前会话复制为分支并切过去 */
+  function forkCurrentSession(): void {
+    flushSession.current()
+    const rec = forkSession(sessionIdRef.current)
+    if (!rec) {
+      pushMsg({ kind: "danger", text: "分支失败", ts: Date.now() })
       return
     }
+    sessionIdRef.current = rec.id
+    historyRef.current = rec.history
+    pushMsg({ kind: "verdict", ok: true, text: "已分支为新会话", detail: [rec.title ?? ""], ts: Date.now() })
+  }
+  function toggleMode(): void {
+    setMode((m) => (m === "chat" ? "shell" : "chat"))
+  }
+  function restoreSession(id: string, label: string): void {
+    if (busy) {
+      pushMsg({ kind: "info", text: "运行中无法切换会话, 先按 Esc / Ctrl+C 中断", ts: Date.now() })
+      return
+    }
+    const rec = loadSession(id)
+    if (!rec) {
+      closePalette()
+      pushMsg({ kind: "danger", text: "会话加载失败", ts: Date.now() })
+      return
+    }
+    sessionIdRef.current = rec.id
+    historyRef.current = rec.history
+    setMsgs(rec.msgs)
+    scrollToBottom()
+    closePalette()
+  }
+  function copyMsg(kind: "assistant" | "user", what: string): void {
+    const last = [...msgs].reverse().find((m) => m.kind === kind)
+    if (!last) {
+      pushMsg({ kind: "info", text: `还没有可复制的${what}`, ts: Date.now() })
+      return
+    }
+    const r = copyToClipboard(last.text)
+    pushMsg({ kind: r.ok ? "verdict" : "danger", ok: r.ok, text: r.msg, detail: r.ok ? [last.text.slice(0, 80)] : undefined, ts: Date.now() })
+  }
+  /** 面板命令执行(名字 = COMMANDS[].name; 无匹配回退到时序分发表) */
+  function runPaletteCommand(name: string): void {
+    if (busy && name !== "help" && name !== "sessions") {
+      // 运行中执行 new/compact/quit 等会打断流式状态; 只允许查看类的 help/sessions
+      closePalette()
+      pushMsg({ kind: "info", text: "运行中: 先按 Esc / Ctrl+C 中断, 再执行该命令", ts: Date.now() })
+      return
+    }
+    switch (name) {
+      case "sessions":
+        openPalette("sessions")
+        return
+      case "help":
+        openPalette("commands")
+        return
+      case "compact":
+        void compactHistory()
+        break
+      case "fork":
+        forkCurrentSession()
+        break
+      case "connect":
+        openConfig()
+        break
+      case "mode":
+        toggleMode()
+        break
+      case "log":
+        pushMsg({ kind: "info", text: `日志文件: ${logPath()}`, detail: logTail(40), ts: Date.now() })
+        break
+      case "usage":
+        pushMsg({ kind: "info", text: "用量统计:", detail: usageDetailLines(sessionIdRef.current), ts: Date.now() })
+        break
+      case "provider":
+        applyProviderCommand("")
+        break
+      default:
+        dispatchLeader(name)
+        break
+    }
+    if (!["sessions", "help"].includes(name)) closePalette()
+  }
+
+  function submit(value: string): void {
+    const trimmed = value.trim()
     if (!trimmed) return
     if (busy) {
       pushMsg({ kind: "info", text: "上一轮仍在运行, 按 Esc / Ctrl+C 中断后再输入", ts: Date.now() })
@@ -441,6 +587,11 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     }
     if (mode === "shell") {
       setInput("")
+      const danger = matchDanger(trimmed)
+      if (danger && !shellAllowAllRef.current) {
+        setConfirmReq({ cmd: trimmed, hint: danger.hint })
+        return
+      }
       void runShell(trimmed)
       return
     }
@@ -454,16 +605,8 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       setInput("")
       return
     }
-    if (trimmed === "/sessions") {
-      const list = listSessions()
-      if (!list.length) {
-        pushMsg({ kind: "info", text: "暂无已保存的会话", ts: Date.now() })
-        return
-      }
-      const detail = list.map((s, i) => `${i + 1}. ${s.firstMsg}  (${s.msgs} 条消息, ${new Date(s.createdAt).toLocaleString()})`)
-      pendingSessionsRef.current = list.map((s, i) => ({ id: s.id, label: s.firstMsg }))
-      pushMsg({ kind: "info", text: "会话列表(输入序号恢复, 如 1):", detail, ts: Date.now() })
-      setInput("")
+    if (trimmed === "/sessions" || trimmed === "/resume") {
+      openPalette("sessions")
       return
     }
     if (trimmed === "/sessions_dir" || trimmed === "/sdir") {
@@ -472,6 +615,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       return
     }
     if (trimmed === "/reset" || trimmed === "/new" || trimmed === "/clear") {
+      shellAllowAllRef.current = false
       flushSession.current()
       historyRef.current = []
       setMsgs([])
@@ -479,17 +623,10 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       sessionIdRef.current = newSessionId(cwd)
       scrollToBottom()
       setInput("")
-      pushMsg({ kind: "info", text: `已保存当前会话并开始新会话 (${sessionIdRef.current})`, ts: Date.now() })
       return
     }
     if (trimmed === "/help") {
-      pushMsg({
-        kind: "info",
-        text: "命令列表(ctrl+x + 字母为快捷键 · Tab 切换 对话/命令行 模式):",
-        detail: helpLines(),
-        ts: Date.now(),
-      })
-      setInput("")
+      openPalette("commands")
       return
     }
     if (trimmed === "/models") {
@@ -528,6 +665,11 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     if (trimmed === "/config" || trimmed === "/connect") {
       openConfig()
       setInput("")
+      return
+    }
+    if (trimmed === "/provider" || trimmed.startsWith("/provider ")) {
+      setInput("")
+      applyProviderCommand(trimmed.slice("/provider".length).trim())
       return
     }
     if (trimmed === "/editor") {
@@ -639,6 +781,13 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
           if (e.type === "text-delta") summary += e.text
         },
       })
+      recordUsage({
+        sessionId: sessionIdRef.current,
+        model: modelName,
+        inputTokens: res.usage.inputTokens,
+        outputTokens: res.usage.outputTokens,
+        latencyMs: 0,
+      })
       void res
       const clean = summary.trim().slice(0, 1000)
       historyRef.current = [
@@ -654,9 +803,13 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     }
   }
 
-  // ---------- 领衔快捷键(ctrl+x + 字母) ----------
+  // ---------- 领衔快捷键(ctrl+x + 字母, 静默: 面板里有全表) ----------
   const leaderRef = useRef<{ target: string | null; timer: ReturnType<typeof setTimeout> | null }>({ target: null, timer: null })
-  const [leaderHint, setLeaderHint] = useState<string | null>(null)
+
+  // 危险命令确认: 命中 matchDanger 的命令不直接执行, 先弹单键确认
+  const [confirmReq, setConfirmReq] = useState<{ cmd: string; hint: string } | null>(null)
+  /** [a] 本会话允许: 危险闸门本会话放行 */
+  const shellAllowAllRef = useRef(false)
 
   function dispatchLeader(action: string): void {
     const actions: Record<string, () => void> = {
@@ -668,16 +821,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
         sessionIdRef.current = newSessionId(cwd)
         scrollToBottom()
       },
-      sessions: () => {
-        const list = listSessions()
-        if (!list.length) {
-          pushMsg({ kind: "info", text: "暂无已保存的会话", ts: Date.now() })
-          return
-        }
-        const detail = list.map((s, i) => `${i + 1}. ${s.firstMsg}  (${s.msgs} 条消息, ${new Date(s.createdAt).toLocaleString()})`)
-        pendingSessionsRef.current = list.map((s, i) => ({ id: s.id, label: s.firstMsg }))
-        pushMsg({ kind: "info", text: "会话列表(输入序号恢复, 如 1):", detail, ts: Date.now() })
-      },
+      sessions: () => openPalette("sessions"),
       themes: () => persistTheme(prev => (prev === "dark" ? "light" : "dark")),
   dense: () => toggleDense(),
       models: () => {
@@ -690,32 +834,10 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       },
       export: () => void exportTranscript(),
       editor: () => void composeInEditor(),
-      copy: () => {
-        // 复制最后一条 assistant 回答(可能跨多次回答取最后一条)
-        const last = [...msgs].reverse().find((m) => m.kind === "assistant")
-        if (!last) {
-          pushMsg({ kind: "info", text: "还没有助手回答可复制", ts: Date.now() })
-          return
-        }
-        const r = copyToClipboard(last.text)
-        pushMsg({ kind: r.ok ? "verdict" : "danger", ok: r.ok, text: r.msg, detail: [last.text.slice(0, 200)], ts: Date.now() })
-      },
-      copyq: () => {
-        // 复制最近一条我发的问题
-        const last = [...msgs].reverse().find((m) => m.kind === "user")
-        if (!last) {
-          pushMsg({ kind: "info", text: "还没有可复制的问题", ts: Date.now() })
-          return
-        }
-        const r = copyToClipboard(last.text)
-        if (!r.ok) {
-          pushMsg({ kind: "danger", text: r.msg, ts: Date.now() })
-        } else {
-          pushMsg({ kind: "verdict", ok: true, text: r.msg, detail: [last.text.slice(0, 200)], ts: Date.now() })
-        }
-      },
+      copy: () => copyMsg("assistant", "回答"),
+      copyq: () => copyMsg("user", "问题"),
       diag: () => setDiagOpen((v) => !v),
-      help: () => pushMsg({ kind: "info", text: "命令列表(ctrl+x + 字母为快捷键 · Tab 补全 / 命令):", detail: helpLines(), ts: Date.now() }),
+      help: () => openPalette("commands"),
       quit: () => {
         flushSession.current()
         exit()
@@ -728,14 +850,12 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
     if (l.timer) clearTimeout(l.timer)
     l.target = null
     l.timer = null
-    setLeaderHint(null)
   }
   function armLeader(): void {
     const l = leaderRef.current
     if (l.timer) clearTimeout(l.timer)
     l.target = "armed"
     l.timer = setTimeout(clearLeader, LEADER_TIMEOUT_MS)
-    setLeaderHint("ctrl+x + 字母: n新 l会话 t主题 g间距 m模型 e编辑器 c复制回答 v复制问题 x导出 d诊断 ?帮助 q退出 · Tab 切换命令行")
   }
   function exitConfirmed(): void {
     flushSession.current()
@@ -743,6 +863,24 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
   }
 
   useInput((ch, key) => {
+    // 危险命令确认: 单键回答前所有键归这里 —— [y] 执行一次 [a] 本会话允许 [Esc] 拒绝
+    if (confirmReq) {
+      if (key.escape) {
+        pushMsg({ kind: "info", text: `已取消: ${confirmReq.hint}(${confirmReq.cmd.slice(0, 60)})`, ts: Date.now() })
+        setConfirmReq(null)
+      } else if (!key.ctrl && ch.toLowerCase() === "y") {
+        const cmd = confirmReq.cmd
+        setConfirmReq(null)
+        void runShell(cmd)
+      } else if (!key.ctrl && ch.toLowerCase() === "a") {
+        const cmd = confirmReq.cmd
+        setConfirmReq(null)
+        shellAllowAllRef.current = true
+        pushMsg({ kind: "info", text: `已放行本会话危险命令(请自行承担后果)`, ts: Date.now() })
+        void runShell(cmd)
+      }
+      return true
+    }
     // Ctrl+C 语义: 忙时取消请求, 空闲首次提示; 3s 内再按退出; 其他按键解除
     if (key.ctrl && ch.toLowerCase() === "c") {
       if (ctrlCArmedRef.current) {
@@ -778,6 +916,80 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       }
       return
     }
+    // 命令面板: 所有键归面板(过滤 → Enter 执行 → Esc 关闭; 会话阶段 d 删 r 改名)
+    if (paletteOpen) {
+      const palCount = palettePhase === "sessions" ? paletteSessionsRef.current.length : paletteMatches(paletteQuery).length
+      if (key.escape) {
+        if (paletteMode === "rename") setPaletteMode("browse")
+        else closePalette()
+      } else if (key.return) {
+        if (paletteMode === "rename") {
+          commitPaletteRename()
+        } else if (palettePhase === "sessions") {
+          const s = paletteSessionsRef.current[paletteSel]
+          if (s) restoreSession(s.id, s.label)
+        } else if (palCount === 0) {
+          // 无匹配: 退回输入继续编辑(首字符 / 原样保留)
+          paletteRestoreRef.current = "/" + paletteQuery
+          setInput(paletteRestoreRef.current)
+          closePalette()
+        } else {
+          runPaletteCommand(paletteMatches(paletteQuery)[Math.min(paletteSel, palCount - 1)]!.name)
+        }
+      } else if (paletteMode === "rename") {
+        // 重命名模式: 输入框内容即新名字, 只允许编辑文本
+        if (key.ctrl && ch.toLowerCase() === "u") setPaletteQuery("")
+        else if (key.backspace) setPaletteQuery((q) => q.slice(0, -1))
+        else if (!key.ctrl && !key.meta && !key.shift && ch) setPaletteQuery((q) => q + ch)
+      } else if (!key.ctrl && !key.meta && !key.shift && ch === "d" && palettePhase === "sessions" && palCount > 0) {
+        // d: 二次确认删除选中会话
+        const target = paletteSessionsRef.current[paletteSel]!
+        if (busy) {
+          paletteDeleteIdRef.current = null
+          pushMsg({ kind: "info", text: "运行中无法管理会话, 先按 Esc / Ctrl+C 中断", ts: Date.now() })
+        } else if (target.id === sessionIdRef.current) {
+          paletteDeleteIdRef.current = null
+          pushMsg({ kind: "info", text: "当前会话不能删除", ts: Date.now() })
+        } else if (paletteDeleteIdRef.current === target.id) {
+          paletteDeleteIdRef.current = null
+          deleteSession(target.id)
+          refreshPaletteSessions()
+          pushMsg({ kind: "verdict", ok: true, text: "会话已删除", detail: [target.label], ts: Date.now() })
+        } else {
+          paletteDeleteIdRef.current = target.id
+          pushMsg({ kind: "info", text: `再按 d 删除: ${target.label}`, ts: Date.now() })
+        }
+      } else if (!key.ctrl && !key.meta && !key.shift && ch === "r" && palettePhase === "sessions" && palCount > 0) {
+        // r: 进入重命名, 输入框预填原名
+        if (busy) {
+          pushMsg({ kind: "info", text: "运行中无法管理会话, 先按 Esc / Ctrl+C 中断", ts: Date.now() })
+        } else {
+          const s = paletteSessionsRef.current[paletteSel]!
+          paletteDeleteIdRef.current = null
+          setPaletteQuery(s.label)
+          setPaletteMode("rename")
+        }
+      } else if (key.tab || key.downArrow) {
+        paletteDeleteIdRef.current = null
+        setPaletteSel((s) => (s + 1) % Math.max(1, palCount))
+      } else if (key.upArrow) {
+        paletteDeleteIdRef.current = null
+        setPaletteSel((s) => (s + Math.max(1, palCount) - 1) % Math.max(1, palCount))
+      } else if (key.ctrl && ch.toLowerCase() === "u") {
+        paletteDeleteIdRef.current = null
+        setPaletteQuery("")
+        setPaletteSel(0)
+      } else if (key.backspace) {
+        paletteDeleteIdRef.current = null
+        setPaletteQuery((q) => q.slice(0, -1))
+        setPaletteSel(0)
+      } else if (!key.ctrl && !key.meta && !key.shift && ch) {
+        paletteDeleteIdRef.current = null
+        setPaletteQuery((q) => q + ch)
+        setPaletteSel(0)
+      }
+      return true
+    }
     // 视口滚动: 输入框为空时 ↑↓ 滚动; PgUp/PgDn/Home/End 始终可滚
     if (key.upArrow || key.downArrow || key.pageUp || key.pageDown || key.home || key.end) {
       if (key.upArrow || key.downArrow) {
@@ -798,13 +1010,12 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       return true
     }
     if (key.tab) {
-      // Tab: 切换 对话模式 ↔ 命令行模式(不再用于 / 补全; 设置面板内 Tab 仍切换字段)
+      // 模式切换(静默, 头部状态同步变化); busy 时禁止
       if (busy) {
-        pushMsg({ kind: "info", text: "运行中无法切换模式, 按 Esc 中断后重试", ts: Date.now() })
+        pushMsg({ kind: "info", text: "运行中无法切换模式", ts: Date.now() })
         return true
       }
-      setMode((m) => (m === "chat" ? "shell" : "chat"))
-      pushMsg({ kind: "info", text: mode === "chat" ? "已切换到命令行模式: 输入直接作为 shell 命令执行 (再按 Tab 切回对话)" : "已切换到对话模式 (再按 Tab 切命令行)", ts: Date.now() })
+      toggleMode()
       return true
     }
     if (key.ctrl && ch.toLowerCase() === "u") {
@@ -816,7 +1027,12 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       return true
     }
     if (key.ctrl && ch.toLowerCase() === "p") {
-      pushMsg({ kind: "info", text: "命令面板(ctrl+x + 字母为快捷键 · Tab 切换 对话/命令行):", detail: helpLines(), ts: Date.now() })
+      openPalette("commands")
+      return true
+    }
+    // "/" 首字符: 空输入敲 / 直接拉出命令面板(全部命令的入口)
+    if (!paletteOpen && !busy && mode === "chat" && input === "" && ch === "/") {
+      openPalette("commands")
       return true
     }
     if (key.ctrl && ch.toLowerCase() === "o") {
@@ -831,7 +1047,6 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
       // Esc 只用于"取消": 关闭面板/取消当前操作/中断请求; 绝不退出(退出只走 Ctrl+C 双击)
       if (previewOpen) {
         setPreviewOpen(false)
-        pushMsg({ kind: "info", text: "已收起长输入预览, 可继续编辑(Enter 再确认发送)", ts: Date.now() })
       } else if (settingsOpen) {
         setSettingsOpen(false)
         setInput("")
@@ -845,9 +1060,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
           controllerRef.current?.abort()
         }
       } else if (mode === "shell") {
-        setMode("chat")
-      } else {
-        pushMsg({ kind: "info", text: "按 Ctrl+C 两次退出 · Esc 仅用于取消", ts: Date.now() })
+        toggleMode()
       }
     }
   })
@@ -873,10 +1086,13 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
   }
 
   const modelName = process.env.LLM_MODEL ?? "默认"
+  const providerInfo = (() => {
+    const p = listProviders()
+    return p.current !== DEFAULT_PROVIDER ? p.current : null
+  })()
   // ---------- 视口度量 ----------
   const { cols, rows } = useTerminalSize(stdout)
   const mdWidth = Math.max(36, cols - 6)
-  const cmdCandidates = !busy && input.startsWith("/") ? matchCommands(input) : []
 
   // 鼠标: 滚轮滚动消息区(自研 SGR 协议)
   const mouseCbRef = useRef<(e: import("./mouse.tsx").MouseEventData) => void>(() => {})
@@ -904,8 +1120,8 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
 
   const mdW = Math.max(1, mdWidth - 2)
   const previewLines = Math.min(PREVIEW_LINES, Math.max(1, Math.ceil(displayWidth(input) / mdW)))
-  const chromeRows =
-    2 + 4 + (settingsOpen ? 6 : 2) + 1 + (diagOpen ? 4 : 0) + Math.min(cmdCandidates.length, 4) + (previewOpen ? 3 + previewLines : 0) + (leaderHint ? 2 : 0) + 1
+  const palCount = paletteOpen ? (palettePhase === "sessions" ? paletteSessionsRef.current.length : paletteMatches(paletteQuery).length) : 0
+  const chromeRows = 2 + 4 + (settingsOpen ? 6 : 2) + 1 + (diagOpen ? 4 : 0) + (previewOpen ? 3 + previewLines : 0) + (paletteOpen ? 6 + Math.min(palCount, PALETTE_MAX_ROWS) : 0) + (confirmReq ? 6 : 0) + 1
   const viewportRows = Math.max(8, rows - chromeRows)
   const heights = useMemo(() => msgs.map((m, i) => estimateMsgHeight(m, mdWidth) + (i === 0 || dense ? 0 : 1)), [msgs, mdWidth, dense])
   const segHeights = [...heights]
@@ -934,9 +1150,18 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
   return (
     <AppErrorBoundary onError={(e) => log.error("tui", "渲染错误", { message: e.message, stack: e.stack })}>
       <Box flexDirection="column" width="100%" paddingX={2} paddingTop={2} paddingBottom={0}>
-        <Header t={t} cwd={cwd} model={modelName} />
+        <Header t={t} cwd={cwd} model={providerInfo ? `${providerInfo} · ${modelName}` : modelName} />
         <Box flexDirection="column" width="100%" height={viewportRows} overflow="hidden">
-          {msgs.length === 0 && <WelcomeCard cwd={cwd} model={modelName} t={t} />}
+          {msgs.length === 0 && (
+            <Box flexDirection="column" width="100%">
+              <Text color={t.accent} bold wrap="wrap">
+                ↓ 输入你的问题开始对话
+              </Text>
+              <Text color={t.inkFaint} wrap="wrap">
+                输入问题直接对话 · 前缀 / 呼出命令面板(Ctrl+P) · Tab 切换 对话/命令行 · Esc 取消 · 双击 Ctrl+C 退出
+              </Text>
+            </Box>
+          )}
           {!scrollLock && effectiveOffset > 0 && (
             <Text color={t.inkFaint} dimColor wrap="wrap">
               ↑ 已滚动 {effectiveOffset} 行 · ↓ 回到底部
@@ -957,23 +1182,31 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
           {fillerRows > 0 && <Box height={fillerRows} />}
         </Box>
 
-        {cmdCandidates.length > 0 && (
-          <Box flexDirection="column" width="100%" marginTop={1}>
-            {cmdCandidates.slice(0, 4).map((c) => (
-              <Text key={c.name} color={t.inkFaint} wrap="wrap">
-                /{c.name} — {c.desc}
-              </Text>
-            ))}
-          </Box>
-        )}
-        {leaderHint && (
-          <Box marginTop={1}>
-            <Text color={t.accent} dimColor wrap="wrap">
-              {leaderHint}
+        {diagOpen && <DiagTray lines={diag} t={t} />}
+        {confirmReq && (
+          <Box flexDirection="column" width="100%" marginTop={1} borderStyle="single" borderColor={t.warn} paddingX={1} paddingY={1}>
+            <Text color={t.warn} bold wrap="wrap">
+              ⚠ 危险命令: {confirmReq.hint}
+            </Text>
+            <Text color={t.ink} wrap="wrap">
+              {confirmReq.cmd}
+            </Text>
+            <Text color={t.inkFaint} wrap="wrap">
+              [y] 执行一次 · [a] 本会话允许 · [Esc] 取消
             </Text>
           </Box>
         )}
-        {diagOpen && <DiagTray lines={diag} t={t} />}
+        {paletteOpen && (
+          <PalettePanel
+            phase={palettePhase}
+            mode={paletteMode}
+            rows={palettePhase === "commands" ? paletteMatches(paletteQuery).map((c) => ({ group: c.group, cmd: c.name, desc: c.desc, shortcut: c.shortcut })) : []}
+            sessions={paletteSessionsRef.current}
+            query={paletteQuery}
+            sel={paletteSel}
+            t={t}
+          />
+        )}
         {previewOpen && (
           <Box flexDirection="column" width="100%" marginTop={1} borderStyle="single" borderColor={t.inkFaint} paddingX={1} paddingY={1}>
             <Box flexDirection="row">
@@ -990,7 +1223,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
           </Box>
         )}
         {settingsOpen ? (
-          <SettingsPanel draft={configDraft} field={configField} t={t} onChange={(key, value) => setConfigDraft((d) => ({ ...d, [key]: value }))} />
+          <SettingsPanel draft={configDraft} field={configField} t={t} providerName={activeProvider()} onChange={(key, value) => setConfigDraft((d) => ({ ...d, [key]: value }))} />
         ) : (
           <Box flexDirection="column" width="100%" marginTop={1}>
             <Box flexDirection="row">
@@ -1009,7 +1242,7 @@ export default function App({ cwd, theme, resume, mouseBus }: { cwd: string; the
                       : `生成中…(Esc 中断) ${spinnerChar}${cps ? ` · ${cps}c/s` : ""}`
                     : mode === "shell"
                       ? "命令行模式: 输入 shell 命令, Enter 执行 · Tab 切回对话"
-                      : "对话: 输入消息 (Ctrl+C 两次退出 · Tab 命令行 · Ctrl+o 配置 · 长输入自动预览)"
+                      : "对话: 输入消息 (Ctrl+P 命令面板 · Tab 命令行 · Ctrl+o 配置 · Esc 取消)"
                 }
                 onChange={setInput}
                 onSubmit={submit}

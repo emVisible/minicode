@@ -6,6 +6,8 @@
 import { createLLMClient } from "./llm.ts"
 import { buildSystemPrompt } from "./prompt.ts"
 import { loadConfig, applyConfigToEnv } from "./config.ts"
+import { saveSession, loadSession, latestSession } from "./session.ts"
+import { recordUsage } from "./usage.ts"
 import { log, installCrashHandlers, logSessionStart, logSessionEnd } from "./log.ts"
 import { homePath, ensureHome, configFile } from "./paths.ts"
 
@@ -15,15 +17,32 @@ interface CliFlags {
   cwd: string
   /** 启动时恢复最近一次会话 */
   resume: boolean
+  /** --resume=<id> 指定会话; 缺省恢复最近 */
+  resumeId?: string
+  /** 本次运行归属的会话(id 为空表示 headless 一次性) */
+  sessionId: string
+  /** 指定 provider(--provider <名字>; 快照来源见 config.ts) */
+  provider?: string
+  /** --json: 单轮结果输出为单个 JSON 对象 */
+  json: boolean
+  /** --stream-json: 每事件输出一行 NDJSON */
+  streamJson: boolean
 }
 
+/** 结构化输出格式 */
+export type OutputFormat = "text" | "json" | "stream-json"
+
 function parseArgs(argv: string[]): { flags: CliFlags; promptArgs: string[] } {
-  const flags: CliFlags = { headless: false, cwd: process.cwd(), resume: false }
+  const flags: CliFlags = { headless: false, cwd: process.cwd(), resume: false, sessionId: "headless", json: false, streamJson: false }
   const promptArgs: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!
     if (arg === "--headless") flags.headless = true
     else if (arg === "-r" || arg === "--resume") flags.resume = true
+    else if (arg.startsWith("--resume=")) {
+      flags.resume = true
+      flags.resumeId = arg.slice("--resume=".length)
+    }
     else if (arg === "--cwd") {
       const next = argv[i + 1]
       if (next !== undefined && !next.startsWith("--")) {
@@ -32,6 +51,15 @@ function parseArgs(argv: string[]): { flags: CliFlags; promptArgs: string[] } {
       }
     } else if (arg.startsWith("--cwd=")) flags.cwd = arg.slice("--cwd=".length)
     else if (arg.startsWith("--model=")) flags.model = arg.slice("--model=".length)
+    else if (arg === "--provider") {
+      const next = argv[i + 1]
+      if (next !== undefined && !next.startsWith("--")) {
+        flags.provider = next
+        i++
+      }
+    } else if (arg.startsWith("--provider=")) flags.provider = arg.slice("--provider=".length)
+    else if (arg === "--json") flags.json = true
+    else if (arg === "--stream-json" || arg === "--stream") flags.streamJson = true
     else promptArgs.push(arg)
   }
   return { flags, promptArgs }
@@ -45,7 +73,21 @@ async function readStdin(): Promise<string> {
 
 // ---------- 对话 ----------
 
-async function runTurn(flags: CliFlags, userContent: string, history: import("./types.ts").ChatMessage[]): Promise<void> {
+interface TurnResult {
+  finish: string
+  text: string
+  inputTokens: number
+  outputTokens: number
+  latencyMs: number
+}
+
+/**
+ * 单轮对话。fmt 决定 stdout 形态:
+ *   text        —— 流式原文 + [finish=...] 收尾(默认)
+ *   json        —— 结束后输出单对象 JSON(delta 不外露)
+ *   stream-json — 每事件一行 NDJSON: {"type":"delta"|"finish"|"error", ...}
+ */
+async function runTurn(flags: CliFlags, userContent: string, history: import("./types.ts").ChatMessage[], fmt: OutputFormat = "text"): Promise<TurnResult> {
   const client = createLLMClient()
   const system = buildSystemPrompt({ cwd: flags.cwd })
   const messages: import("./types.ts").ChatMessage[] = [
@@ -53,13 +95,36 @@ async function runTurn(flags: CliFlags, userContent: string, history: import("./
     ...history,
     { role: "user", content: userContent },
   ]
+  let text = ""
+  const total = Date.now()
+  const model = flags.model ?? process.env.LLM_MODEL ?? "默认"
   const result = await client.stream({
     messages,
     onEvent: (e) => {
-      if (e.type === "text-delta") process.stdout.write(e.text)
+      if (e.type === "text-delta") {
+        text += e.text
+        if (fmt === "text") process.stdout.write(e.text)
+        else if (fmt === "stream-json") process.stdout.write(`${JSON.stringify({ type: "delta", text: e.text })}\n`)
+      }
     },
   })
-  process.stdout.write(`\n\n[finish=${result.finish} ]\n`)
+  const latencyMs = Date.now() - total
+  recordUsage({
+    sessionId: flags.sessionId,
+    model,
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    latencyMs,
+  })
+  if (fmt === "stream-json") {
+    process.stdout.write(`${JSON.stringify({ type: "usage", inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, latencyMs })}\n`)
+    process.stdout.write(`${JSON.stringify({ type: "done", finish: result.finish, text })}\n`)
+  } else if (fmt === "json") {
+    process.stdout.write(`${JSON.stringify({ ok: true, finish: result.finish, text, model, sessionId: flags.sessionId, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, latencyMs })}\n`)
+  } else {
+    process.stdout.write(`\n\n[finish=${result.finish}]\n`)
+  }
+  return { finish: result.finish, text, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, latencyMs }
 }
 
 async function main(): Promise<void> {
@@ -75,6 +140,8 @@ async function runMain(): Promise<number> {
   const argv = process.argv.slice(2)
 
   const { flags, promptArgs } = parseArgs(argv)
+  // 结构化输出只对 headless 有意义(强制无 TUI 分支)
+  if (flags.json || flags.streamJson) flags.headless = true
 
   // 缓存/配置目录: 项目内 .minicode/(可被 MINICODE_HOME 显式覆盖), 启动即确保存在
   if (!process.env.MINICODE_HOME) {
@@ -83,6 +150,8 @@ async function runMain(): Promise<number> {
   ensureHome(flags.cwd)
 
   // 启动即加载用户配置: 填充未设置的环境变量(环境变量优先)
+  // --provider: 映射为 LLM_PROVIDER(不改写配置文件; 用户自设 LLM_PROVIDER 恒优)
+  if (flags.provider && !process.env.LLM_PROVIDER) process.env.LLM_PROVIDER = flags.provider
   applyConfigToEnv(loadConfig(flags.cwd))
   log.info("paths", "数据目录", { home: process.env.MINICODE_HOME, config: configFile(flags.cwd) })
 
@@ -133,17 +202,48 @@ async function runMain(): Promise<number> {
 
   const rawPrompt = promptArgs.join(" ") || (process.stdin.isTTY ? "" : await readStdin())
   if (!rawPrompt) {
-    console.error("未提供 prompt(可以用管道: echo '...' | minicode --headless)")
+    if (flags.json || flags.streamJson) process.stdout.write(`${JSON.stringify({ ok: false, error: "未提供 prompt(可用管道: echo '...' | minicode --headless)", exitCode: 1 })}\n`)
+    else console.error("未提供 prompt(可以用管道: echo '...' | minicode --headless)")
     return 1
   }
 
   log.info("headless", "启动", { prompt: rawPrompt.slice(0, 200) })
-  await runTurn(flags, rawPrompt, [])
+
+  // headless 续接: --resume 恢复会话历史再追问, 回答落回同一会话
+  if (flags.resume) {
+    const rec = flags.resumeId ? loadSession(flags.resumeId) : latestSession()
+    if (!rec) {
+      log.info("headless", "无可恢复会话")
+      if (flags.json || flags.streamJson) process.stdout.write(`${JSON.stringify({ ok: false, error: flags.resumeId ? `会话不存在: ${flags.resumeId}` : "没有已保存的会话可恢复", exitCode: 1 })}\n`)
+      else console.error(flags.resumeId ? `会话不存在: ${flags.resumeId}` : "没有已保存的会话可恢复")
+      return 1
+    }
+    flags.sessionId = rec.id
+    const fmt: OutputFormat = flags.json ? "json" : flags.streamJson ? "stream-json" : "text"
+    const { text } = await runTurn(flags, rawPrompt, rec.history, fmt)
+    const ts = Date.now()
+    rec.msgs.push({ kind: "user", text: rawPrompt, ts })
+    if (text) rec.msgs.push({ kind: "assistant", text, ts: Date.now() })
+    rec.history.push({ role: "user", content: rawPrompt })
+    if (text) rec.history.push({ role: "assistant", content: text })
+    saveSession(rec)
+    return 0
+  }
+
+  const fmt: OutputFormat = flags.json ? "json" : flags.streamJson ? "stream-json" : "text"
+  await runTurn(flags, rawPrompt, [], fmt)
   return 0
 }
 
 main().catch((e) => {
   log.error("main", "致命错误", { message: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? e.stack : undefined })
-  console.error(`\n✗ ${e instanceof Error ? e.message : String(e)}`)
-  process.exit(1)
+  const msg = e instanceof Error ? e.message : String(e)
+  // 退出码: 0 成功 / 1 一般失败(重试耗尽、网络、中断前) / 2 配置缺失(未设置 LLM_URL)
+  const code = /未配置 LLM_URL|未配置端点/.test(msg) ? 2 : 1
+  const flags = parseArgs(process.argv.slice(2)).flags
+  if (flags.json || flags.streamJson) {
+    process.stdout.write(`${JSON.stringify({ ok: false, error: msg, exitCode: code, type: flags.streamJson ? "error" : undefined })}\n`)
+  }
+  console.error(`\n✗ ${msg}`)
+  process.exit(code)
 })

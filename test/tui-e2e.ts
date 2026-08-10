@@ -68,6 +68,7 @@ warmup = float(sys.argv[2])
 post = float(sys.argv[3])
 esc_first = len(sys.argv) > 4 and sys.argv[4] == "esc"
 tab_first = len(sys.argv) > 4 and sys.argv[4] == "tab"
+danger_first = len(sys.argv) > 4 and sys.argv[4] == "danger"
 
 def set_size(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -102,6 +103,16 @@ try:
         pump(0.2)
         os.write(fd, b"\\r")
         pump(post)
+    elif danger_first:
+        # 场景 D: 危险命令(rm -rf /)不直接执行, 出现确认框; Esc 拒绝后继续运行
+        os.write(fd, b"\\t")
+        pump(0.5)
+        os.write(fd, b"rm -rf / --e2e-noop")
+        pump(0.2)
+        os.write(fd, b"\\r")
+        pump(post)
+        os.write(fd, b"\\x1b")
+        pump(1.0)
     else:
         if esc_first:
             # 场景 B: 先按 Esc(应显示"取消"提示而不是退出), 再正常聊天
@@ -146,11 +157,12 @@ interface RunResult {
   driverErr: string
 }
 
-function runTui({ warmup, post, home, llmUrl, escFirst, tabFirst }: { warmup: number; post: number; home: string; llmUrl: string; escFirst?: boolean; tabFirst?: boolean }): Promise<RunResult> {
+function runTui({ warmup, post, home, llmUrl, escFirst, tabFirst, dangerFirst }: { warmup: number; post: number; home: string; llmUrl: string; escFirst?: boolean; tabFirst?: boolean; dangerFirst?: boolean }): Promise<RunResult> {
   const outPath = join(tmpdir(), `tui-capture-${Date.now()}.txt`)
   const args = ["-c", PY_DRIVER, outPath, String(warmup), String(post)]
   if (escFirst) args.push("esc")
   if (tabFirst) args.push("tab")
+  if (dangerFirst) args.push("danger")
   return new Promise((resolve) => {
     const child = spawn("python3", args, {
       env: {
@@ -242,11 +254,31 @@ async function scenarioC(): Promise<void> {
   rmSync(home, { recursive: true, force: true })
 }
 
+// ---------- 场景 D: 危险命令确认闸门 ----------
+
+async function scenarioD(): Promise<void> {
+  console.log("\nD: 危险命令(rm -rf /)先弹确认框, Esc 拒绝后不执行")
+  const home = mkdtempSync(join(tmpdir(), "tui-home-"))
+  const r = await runTui({
+    warmup: 2.5,
+    post: 3.5,
+    home,
+    llmUrl: "http://127.0.0.1:9734/v1/chat/completions",
+    dangerFirst: true,
+  })
+  const out = r.out
+  check("D1 危险命令不直接执行(出现确认框)", out.includes("危险命令") && out.includes("rm -rf / --e2e-noop"), JSON.stringify(out.split("\n").filter((l) => l.includes("危险"))))
+  check("D2 Esc 拒绝后提示已取消", out.includes("已取消"), out.slice(-400))
+  check("D3 拒绝后程序可用, 双击 Ctrl+C 退出", r.exitCode === 0, `exit=${r.exitCode}`)
+  rmSync(home, { recursive: true, force: true })
+}
+
 async function main(): Promise<void> {
   console.log("TUI e2e (PTY)")
   await scenarioA()
   await scenarioB()
   await scenarioC()
+  await scenarioD()
   console.log(`\nTUI e2e: ${passed} passed, ${failed} failed`)
   process.exit(failed > 0 ? 1 : 0)
 }

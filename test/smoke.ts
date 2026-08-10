@@ -7,8 +7,9 @@ import { mkdtempSync, readFileSync, statSync, rmSync, writeFileSync, existsSync 
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { LLMClient } from "../src/llm.ts"
-import { loadConfig, saveConfig, applyConfigToEnv, configPath } from "../src/config.ts"
-import { saveSession, listSessions, loadSession, deleteSession, newSessionId, latestSession, sessionsDirPath } from "../src/session.ts"
+import { loadConfig, saveConfig, applyConfigToEnv, configPath, switchProvider, activeProvider, listProviders, saveProviderProfile, resetForcedEnv, registerForcedEnv, DEFAULT_PROVIDER } from "../src/config.ts"
+import { saveSession, listSessions, loadSession, deleteSession, renameSession, forkSession, newSessionId, latestSession, sessionsDirPath } from "../src/session.ts"
+import { recordUsage, sessionUsage, usageSummary, usageDetailLines, usageDayKey, flushUsage } from "../src/usage.ts"
 import { homePath, configFile, ensureHome, sessionsDir } from "../src/paths.ts"
 import type { ChatMessage } from "../src/types.ts"
 
@@ -97,6 +98,8 @@ async function runIsolated(): Promise<void> {
   testConfig()
   await testLLM()
   testSession()
+  testUsage()
+  await testHeadlessOutput()
 }
 
 // ---------- 路径解析(项目内缓存) ----------
@@ -143,6 +146,35 @@ process.env.LLM_URL = "http://direct/v1"
 
   writeFileSync(cfgPath, "{bad json", "utf8")
   check("损坏配置回退空", loadConfig().llmUrl === undefined)
+
+  // ---------- 多 provider profile ----------
+  saveConfig({ llmUrl: "http://legacy/v1", llmModel: "legacy-model" })
+  check("无快照时列表只含 default", listProviders().names.length === 1 && listProviders().names[0] === DEFAULT_PROVIDER)
+  check("无快照时当前为 default", activeProvider() === DEFAULT_PROVIDER)
+
+  switchProvider("anthropic")
+  check("切换后当前为 anthropic", activeProvider() === "anthropic" && listProviders().current === "anthropic")
+  const after = loadConfig()
+  check("新 provider 未配置时回退 legacy 顶层字段", after.llmUrl === "http://legacy/v1" && after.llmModel === "legacy-model")
+
+  saveProviderProfile({ url: "https://api.anthropic.com/v1", apiKey: "sk-an", model: "claude-sonnet" })
+  const switched = loadConfig()
+  check("快照保存后当前 provider 生效", switched.llmUrl === "https://api.anthropic.com/v1" && switched.llmApiKey === "sk-an" && switched.llmModel === "claude-sonnet")
+
+  switchProvider("default")
+  const backTo = loadConfig()
+  check("切回 default 保留 legacy 字段", backTo.llmUrl === "http://legacy/v1" && backTo.llmModel === "legacy-model" && backTo.llmApiKey === undefined)
+  check("provider 列表含两个", listProviders().names.length === 2 && listProviders().names.includes("anthropic"))
+
+  const userEnv = process.env.LLM_URL
+  process.env.LLM_URL = "http://user-hard/v1"
+  applyConfigToEnv(loadConfig())
+  check("用户 env 恒优(不受配置注入影响)", process.env.LLM_URL === "http://user-hard/v1")
+  resetForcedEnv()
+  if (userEnv === undefined) delete process.env.LLM_URL
+  process.env.LLM_URL = ""
+  delete process.env.LLM_PROVIDER
+  switchProvider(DEFAULT_PROVIDER)
 }
 
 // ---------- LLM 流式 ----------
@@ -266,8 +298,85 @@ function testSession(): void {
   const latest = latestSession()
   check("会话可恢复最近", latest !== null && latest.id === id)
 
+  renameSession(id, "我的任务A")
+  const renamed = listSessions().find((s) => s.id === id)
+  check("会话可重命名(title 写入且列表可见)", renamed?.title === "我的任务A", JSON.stringify(renamed?.title ?? null))
+
+  const fork = forkSession(id)
+  check("会话可分支(新 id, 内容保留)", fork !== null && fork.id !== id && fork.msgs.length === 3, fork ? `newId=${fork.id} msgs=${fork.msgs.length}` : "null")
+  const forked = listSessions().some((s) => s.id === fork?.id)
+  check("分支后可在列表出现", forked === true)
+
   deleteSession(id)
   check("会话可删除", listSessions().every((s) => s.id !== id))
+  deleteSession(fork!.id)
+}
+
+// ---------- 用量账本 ----------
+
+function testUsage(): void {
+  flushUsage()
+  const day = usageDayKey(1600000000000)
+  recordUsage({ ts: 1600000000000, sessionId: "u1", model: "mock", inputTokens: 10, outputTokens: 20, latencyMs: 300 })
+  recordUsage({ ts: 1600000000000, sessionId: "u1", model: "mock", inputTokens: 5, outputTokens: 30, latencyMs: 400 })
+  recordUsage({ ts: 1600086400000, sessionId: "u2", model: "mock", inputTokens: 1, outputTokens: 99, latencyMs: 200 })
+  const s = sessionUsage("u1")
+  check("用量: 同会话累加", s !== undefined && s.turns === 2 && s.inputTokens === 15 && s.outputTokens === 50, JSON.stringify(s))
+  const { today, days } = usageSummary()
+  check("用量: 按天聚合(今日+历史)", days.some((d) => d.day === usageDayKey(1600000000000)), JSON.stringify(days))
+  void today
+  const lines = usageDetailLines("u1")
+  check("用量: /usage 展示行包含会话累计", lines.some((l) => l.includes("2 轮")), lines.join("|"))
+  flushUsage()
+}
+
+// ---------- headless 结构化输出(真子进程) ----------
+
+import { spawn } from "node:child_process"
+
+function runHeadless(env: Record<string, string | undefined>, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+      cwd: process.cwd(),
+      env: { ...process.env, ...env },
+    })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (d) => (stdout += String(d)))
+    child.stderr.on("data", (d) => (stderr += String(d)))
+    const t = setTimeout(() => child.kill("SIGKILL"), 30_000)
+    child.on("close", (code) => {
+      clearTimeout(t)
+      resolve({ code, stdout, stderr })
+    })
+  })
+}
+
+async function testHeadlessOutput(): Promise<void> {
+  const s = await serve((_req, res, _body) => {
+    const e = sse(res)
+    e.chunk("结构化回答")
+    e.finish()
+  })
+  const env = { LLM_URL: `http://127.0.0.1:${s.port}/v1/chat/completions`, LLM_API_KEY: "", LLM_MODEL: "mock", LLM_PROVIDER: "" }
+  const j = await runHeadless(env, ["--headless", "--json", "你好"])
+  const parsed = JSON.parse(j.stdout.trim())
+  check("headless --json: 单对象 + ok + 文本", parsed.ok === true && parsed.text === "结构化回答" && parsed.finish === "stop", j.stdout.slice(0, 200))
+  check("headless --json: 退出码 0", j.code === 0, `code=${j.code}`)
+
+  const st = await runHeadless(env, ["--headless", "--stream-json", "你好"])
+  const lines = st.stdout.trim().split("\n").map((l) => JSON.parse(l))
+  const types = lines.map((l) => l.type)
+  check("headless --stream-json: delta→usage→done 顺序", types.includes("delta") && types[types.length - 1] === "done", types.join(","))
+  check("headless --stream-json: 退出码 0", st.code === 0, `code=${st.code}`)
+
+  const miss = await runHeadless({ ...env, LLM_URL: "", API_URL: "", MINICODE_CONFIG: "/dev/null" }, ["--headless", "--json", "hi"])
+  let missObj: { ok?: boolean; exitCode?: number } | null = null
+  try {
+    missObj = JSON.parse(miss.stdout.trim())
+  } catch {}
+  check("headless --json: 未配置端点 → JSON error + 退出码 2", missObj?.ok === false && missObj?.exitCode === 2 && miss.code === 2, `code=${miss.code} out=${miss.stdout.slice(0, 120)}`)
+  await s.close()
 }
 
 void main()

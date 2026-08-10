@@ -16,6 +16,8 @@ export interface SessionRecord {
   createdAt: number
   msgs: ChatMsg[]
   history: ChatMessage[]
+  /** 会话标题(/rename 设置; 未设置时用首条消息) */
+  title?: string
 }
 
 function sessionsDir(): string {
@@ -38,7 +40,7 @@ export function saveSession(s: SessionRecord): void {
 }
 
 /** 列出全部会话(按创建时间倒序, 只读元信息) */
-export function listSessions(): Array<{ id: string; cwd: string; createdAt: number; firstMsg: string; msgs: number }> {
+export function listSessions(): Array<{ id: string; cwd: string; createdAt: number; firstMsg: string; title: string | null; msgs: number }> {
   try {
     return readdirSync(sessionsDir())
       .filter((f) => f.endsWith(".json"))
@@ -51,6 +53,7 @@ export function listSessions(): Array<{ id: string; cwd: string; createdAt: numb
             cwd: raw.cwd,
             createdAt: raw.createdAt,
             firstMsg: raw.msgs.find((m) => m.kind === "user")?.text.slice(0, 60) ?? "(空会话)",
+            title: raw.title ?? null,
             msgs: raw.msgs.length,
           }
         } catch {
@@ -90,6 +93,28 @@ export function deleteSession(id: string): void {
   } catch {
     // ignore
   }
+}
+
+/** 重命名会话(设置 title; 空名称清除) */
+export function renameSession(id: string, title: string): void {
+  const rec = loadSession(id)
+  if (!rec) return
+  rec.title = title.trim() || undefined
+  saveSession(rec)
+}
+
+/** 分支: 把现有会话复制为新会话(新 id, 保留全部内容与历史) */
+export function forkSession(id: string): SessionRecord | null {
+  const rec = loadSession(id)
+  if (!rec) return null
+  const copy: SessionRecord = {
+    ...rec,
+    id: newSessionId(rec.cwd),
+    createdAt: Date.now(),
+    title: rec.title ?? rec.msgs.find((m) => m.kind === "user")?.text.slice(0, 40) ?? "分支",
+  }
+  saveSession(copy)
+  return copy
 }
 
 /** 生成会话 id(时间戳 + cwd 简称) */

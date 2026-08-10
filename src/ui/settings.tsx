@@ -17,9 +17,10 @@ export function SettingsPanel(props: {
   draft: MinicodeConfig
   field: number
   t: ThemeTokens
+  providerName?: string
   onChange: (key: keyof MinicodeConfig, value: string) => void
 }): ReactNode {
-  const { draft, field, t, onChange } = props
+  const { draft, field, t, providerName, onChange } = props
 
   const displayValue = (f: (typeof FIELDS)[number]): string => {
     const raw = draft[f.key]
@@ -31,9 +32,12 @@ export function SettingsPanel(props: {
 
   return (
     <Box marginTop={1} flexDirection="column" width="100%">
-      <Text color={t.accent} bold>
-        ⚙ 设置
-      </Text>
+      <Box flexDirection="row">
+        <Text color={t.accent} bold>
+          ⚙ 设置
+        </Text>
+        <Text color={t.inkFaint}>　provider: @{providerName ?? "default"}(/provider 切换)</Text>
+      </Box>
       <Box flexDirection="column" marginTop={1}>
         {FIELDS.map((f, i) => {
           const active = i === field

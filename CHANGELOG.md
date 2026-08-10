@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+### 2026-08-10 v0.6.4 多 provider 与 headless 结构化输出
+- **多 provider 快照**: 配置支持 `providers: {名字: {url, apiKey, model}}` + `provider: 当前名`; 顶层 llm* 字段视为 "default" 快照(向后兼容, 自动折算); 生效优先级: 环境变量 > 当前快照 > 遗留顶层字段
+- **`/provider`**: 无参列出全部 provider 与当前项; 带参创建(必要时)并切换, 立即重算进程 env(用户自设 env 恒优, 本模块注入的 env 在切换时撤销); 设置面板页头显示当前 provider, 保存写入当前快照; 头部模型标签在非 default 时显示 `provider · model`
+- **headless**: `--provider <名字>` 指定快照(映射为 LLM_PROVIDER, 不改写配置); `--json` 单对象输出 `{ok, finish, text, model, sessionId, inputTokens, outputTokens, latencyMs}`; `--stream-json` NDJSON 逐事件 `delta/usage/done`; 退出码: 0 成功 / 1 失败(网络/重试耗尽) / 2 配置缺失(未设置 LLM_URL)
+- 门禁: `pnpm smoke(39· 新增 provider 快照与 headless 结构化断言) && pnpm smoke:ui(18) && pnpm smoke:tui(13)` 全绿
+
+### 2026-08-09 v0.6.3 用量统计与危险命令闸门
+- **用量统计** `src/usage.ts`: 自动按会话记录 token / 轮次 / 首字耗时, 落盘 `<home>/usage.json`(会话 + 按天聚合, 300ms 防抖); 每次回答 verdict 行附 `↑in ↓out · 耗时` 一次链路耗时; **`/usage`** 展示 本会话/今日/累计 三行(命令面板内搜 usage 也可); TUI 与 headless(`--resume` 归属原会话)都记录
+- **危险命令确认**: 命令行模式执行的命令先过 `src/danger.ts` 静态闸门(rm 根/家目录、.git/.minicode 删除、管道执行远端脚本、git push --force、mkfs/dd 磁盘级、关机重启、fork 炸弹、chmod 777 根目录等); 命中不执行, 弹单键确认框 —— `y` 执行一次 · `a` 本会话放行 · `Esc` 取消(误报可 `/new` 清零放行)
+- 门禁: `pnpm smoke(26) && pnpm smoke:ui(18· 新增 danger 规则) && pnpm smoke:tui(13· 新增危险命令 E2E)` 全绿
+
+### 2026-08-09 v0.6.2 会话治理
+- **命令面板 sessions 阶段操作**: `d` 删除选中会话(二次确认防误触; 当前会话禁止删除), `r` 重命名(输入框预填原名, Enter 提交 / Esc 取消, 写入会话 `title` 字段, 列表优先展示标题); 面板内会话操作在 `busy` 时被拒绝
+- **`/fork` 分支**: 把当前会话复制为新会话(新 id, 内容与历史保留)并切换过去; headless `--resume[=<id>]` 支持指定会话续问, 回答落回原会话(msgs + history 追加)
+- session.ts 新增 `title` 字段与 `renameSession` / `forkSession`; smoke 会话断言 20→23
+- 面板加载/删除/重命名统一走 `refreshPaletteSessions`(标题展示 + 选中位置收敛)
+
+### 2026-08-09 v0.6.1 命令面板与界面静默化
+- **命令面板** (`src/ui/palette.tsx`): Ctrl+P 或输入框首字符 `/` 呼出 —— 全部命令分组展示(对话/配置/系统)并带快捷键列, 打字即过滤, ↑↓ 选择, Enter 执行, Esc 关闭; 会话恢复也走面板(ctrl+x `l` / `/sessions`); 面板打开时记住输入草稿, 关闭后还原
+- **命令单一来源**: `src/commands.ts` 的 `COMMANDS` 增加 group/shortcut 字段, "/" 命令、ctrl+x 领衔键、命令面板三处共用一个注册表 + `LEADER_KEYS` 映射 + `paletteMatches` 过滤
+- **界面静默化**: Tab 切换模式 / Esc 取消 / ctrl+x 二级键均不再推送任何操作提示(提示区只剩命令面板); /help 与 ctrl+x `?` 改为直接打开面板; 空态欢迎内联一行引导
+- **打磨**: 面板高度计入视口预留(不再挤输入框); `busy` 时面板只放行查看类命令; 移除 `ui/welcome.tsx`; Esc 在预览窗收起后不再弹"已收起"提示
+- 门禁: `pnpm typecheck && pnpm smoke(20) && pnpm smoke:ui(14) && pnpm smoke:tui(10)` 全绿
+
 ### 2026-08-09 v0.6 对话界面打磨
 - **聊天气泡**: 我的消息右对齐气泡(宽度随内容自适应, 与滚动高度估算同一语义); 回答保持左对齐
 - **长输入预览**: 输入超过 2×消息区宽或含换行时, Enter 先弹独立预览窗查看完整内容(Enter 确认发送 · Esc 收起); exit 语义不变
