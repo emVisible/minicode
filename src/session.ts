@@ -18,6 +18,8 @@ export interface SessionRecord {
   history: ChatMessage[]
   /** 会话标题(/rename 设置; 未设置时用首条消息) */
   title?: string
+  /** 已归档(v0.7): 默认列表里隐藏, /archived 查看恢复 */
+  archived?: boolean
 }
 
 function sessionsDir(): string {
@@ -39,8 +41,8 @@ export function saveSession(s: SessionRecord): void {
   }
 }
 
-/** 列出全部会话(按创建时间倒序, 只读元信息) */
-export function listSessions(): Array<{ id: string; cwd: string; createdAt: number; firstMsg: string; title: string | null; msgs: number }> {
+/** 列出全部会话(按创建时间倒序, 只读元信息, 含归档标记) */
+export function listSessions(): Array<{ id: string; cwd: string; createdAt: number; firstMsg: string; title: string | null; msgs: number; archived: boolean }> {
   try {
     return readdirSync(sessionsDir())
       .filter((f) => f.endsWith(".json"))
@@ -55,6 +57,7 @@ export function listSessions(): Array<{ id: string; cwd: string; createdAt: numb
             firstMsg: raw.msgs.find((m) => m.kind === "user")?.text.slice(0, 60) ?? "(空会话)",
             title: raw.title ?? null,
             msgs: raw.msgs.length,
+            archived: raw.archived === true,
           }
         } catch {
           return null
@@ -79,11 +82,19 @@ export function loadSession(id: string): SessionRecord | null {
   }
 }
 
-/** 最近一次会话(--resume 用) */
+/** 最近一次未归档会话(--resume 用) */
 export function latestSession(): SessionRecord | null {
-  const list = listSessions()
-  if (!list.length) return null
-  return loadSession(list[0]!.id)
+  const list = listSessions().find((s) => !s.archived)
+  if (!list) return null
+  return loadSession(list.id)
+}
+
+/** 设置/取消归档(可逆, 仅改标记) */
+export function setArchived(id: string, archived: boolean): void {
+  const rec = loadSession(id)
+  if (!rec) return
+  rec.archived = archived
+  saveSession(rec)
 }
 
 /** 删除会话 */

@@ -22,13 +22,19 @@ export const COMMANDS: CommandDef[] = [
   { name: "export", usage: "/export", desc: "导出会话为 Markdown", group: "对话", shortcut: "ctrl+x x" },
   { name: "compact", usage: "/compact", desc: "长会话压缩成摘要", group: "对话" },
   { name: "fork", usage: "/fork", desc: "把当前会话复制为分支(新会话, 内容保留)", group: "对话", shortcut: "ctrl+x f" },
+  { name: "archive", usage: "/archive", desc: "归档当前会话(列表隐藏, 可恢复)", group: "对话" },
+  { name: "archived", usage: "/archived", desc: "已归档会话(Enter 恢复即取消归档)", group: "对话" },
   { name: "connect", usage: "/connect", desc: "LLM 配置(URL / Key / 模型)", group: "配置", shortcut: "ctrl+o", aliases: ["config"] },
   { name: "themes", usage: "/themes", desc: "切换明暗主题(持久保存)", group: "配置", shortcut: "ctrl+x t" },
   { name: "dense", usage: "/dense", desc: "消息紧凑 / 宽松间距(持久保存)", group: "配置", shortcut: "ctrl+x g" },
   { name: "models", usage: "/models", desc: "当前模型信息", group: "配置", shortcut: "ctrl+x m" },
   { name: "usage", usage: "/usage", desc: "用量统计(会话 + 今日 + 累计)", group: "配置", shortcut: "ctrl+x u" },
+  { name: "status", usage: "/status", desc: "会话总览(provider/模型/上下文占用/用量)", group: "配置" },
+  { name: "statusline", usage: "/statusline", desc: "底部状态行 开关(默认开)", group: "配置" },
+  { name: "notify", usage: "/notify", desc: "长回答完成终端通知 开关", group: "配置" },
   { name: "provider", usage: "/provider [名字]", desc: "切换 LLM provider(无参列出; 名字不存在则创建并切换)", group: "配置", shortcut: "ctrl+x o" },
   { name: "log", usage: "/log", desc: "查看日志文件", group: "配置" },
+  { name: "update", usage: "/update", desc: "版本信息与更新提示", group: "配置" },
   { name: "mode", usage: "Tab", desc: "切换 对话 ↔ 命令行执行", group: "系统", shortcut: "tab" },
   { name: "help", usage: "/help", desc: "本面板即帮助", group: "系统", shortcut: "ctrl+p" },
   { name: "diag", usage: "/diag", desc: "诊断托盘", group: "系统", shortcut: "ctrl+x d" },
@@ -68,6 +74,18 @@ export function paletteMatches(query: string): CommandDef[] {
 
 /** 命令面板单屏行数上限(其余滚动) */
 export const PALETTE_MAX_ROWS = 9
+
+/**
+ * MRU 排序: 按最近使用时间倒序(未用过的保持注册表顺序)。
+ * mru: 命令名 → 最近执行时间戳(会话级内存, App 维护)。
+ */
+export function rankCommands(query: string, mru: Record<string, number> = {}): CommandDef[] {
+  const list = paletteMatches(query)
+  const scored = list
+    .map((c, i) => ({ c, i, used: mru[c.name] ?? 0 }))
+    .sort((a, b) => b.used - a.used || a.i - b.i)
+  return scored.map((x) => x.c)
+}
 
 /** 按输入文本找候选命令(用于 / 补全与分发)。 */
 export function matchCommands(text: string): CommandDef[] {

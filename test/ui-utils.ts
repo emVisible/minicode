@@ -3,8 +3,11 @@
 
 import { strict as assert } from "node:assert"
 import { computeWindow, clampOffset, totalHeight, estimateMsgHeight, estimateMarkdownHeight } from "../src/ui/viewport.tsx"
-import { COMMANDS, LEADER_KEYS, matchCommands, helpLines, transcriptName } from "../src/commands.ts"
+import { COMMANDS, LEADER_KEYS, matchCommands, helpLines, transcriptName, rankCommands } from "../src/commands.ts"
 import { parseMouseSeq, createMouseFilterStdin } from "../src/ui/mouse.tsx"
+import { formatDuration } from "../src/ui/statusline.tsx"
+import { fmtTokens } from "../src/usage.ts"
+import { walkHistory, rememberInput } from "../src/input-history.ts"
 import { Readable } from "node:stream"
 
 let pass = 0
@@ -116,6 +119,81 @@ check("LEADER_KEYS 映射完整", () => {
 
 check("transcriptName 时间戳格式", () => {
   assert.match(transcriptName(), /^transcript-\d{8}-\d{6}\.md$/)
+})
+
+// ---------- v0.7 体验层纯函数: 状态行时长 / token 格式化 / 新命令注册 ----------
+
+check("formatDuration 会话时长格式", () => {
+  assert.equal(formatDuration(0), "0:00")
+  assert.equal(formatDuration(10_500), "0:10")
+  assert.equal(formatDuration(61_000), "1:01")
+  assert.equal(formatDuration(12 * 60_000 + 5_000), "12:05")
+})
+
+check("fmtTokens 千分位缩写", () => {
+  assert.equal(fmtTokens(0), "0")
+  assert.equal(fmtTokens(340), "340")
+  assert.equal(fmtTokens(1_234), "1.2k")
+  assert.equal(fmtTokens(99_900), "99.9k")
+})
+
+check("v0.7 新命令注册齐全", () => {
+  for (const name of ["status", "statusline", "notify"]) {
+    assert.ok(COMMANDS.some((c) => c.name === name), `command ${name}`)
+  }
+})
+
+// ---------- v0.7 输入历史(Ctrl+↑/↓) ----------
+
+check("walkHistory 向上回填最新条目并从 -1 起步", () => {
+  const entries = ["b", "a"]
+  const r1 = walkHistory(entries, -1, -1, "draft")
+  assert.deepEqual(r1, { idx: 0, value: "b" })
+  const r2 = walkHistory(entries, 0, -1, "draft")
+  assert.deepEqual(r2, { idx: 1, value: "a" })
+  const r3 = walkHistory(entries, 1, -1, "draft")
+  assert.deepEqual(r3, { idx: 1, value: "a" }, "越界夹紧到最后一条")
+})
+
+check("walkHistory 向下回到草稿", () => {
+  const entries = ["b", "a"]
+  const r1 = walkHistory(entries, 0, 1, "draft")
+  assert.deepEqual(r1, { idx: 1, value: "a" })
+  const r2 = walkHistory(entries, 1, 1, "draft")
+  assert.deepEqual(r2, { idx: -1, value: "draft" }, "越过最后一条恢复草稿")
+  assert.deepEqual(walkHistory(entries, -1, 1, "draft"), { idx: -1, value: "draft" }, "无浏览时不动作")
+})
+
+check("walkHistory 空历史不动", () => {
+  assert.deepEqual(walkHistory([], -1, -1, "d"), { idx: -1, value: "d" })
+})
+
+check("rememberInput 去重置顶 + 上限", () => {
+  assert.deepEqual(rememberInput(["a"], "b"), ["b", "a"])
+  assert.deepEqual(rememberInput(["a", "b"], "a"), ["a", "b"], "重复项不新增")
+  assert.deepEqual(rememberInput(["a"], "", 0), ["a"], "空输入不记")
+  assert.deepEqual(rememberInput(["1", "2"], "3", 2), ["3", "1"], "cap 生效")
+})
+
+// ---------- v0.7 命令 MRU 排序 ----------
+
+check("rankCommands 无 MRU 时保持注册顺序", () => {
+  const names = rankCommands("").map((c) => c.name)
+  const expect = COMMANDS.map((c) => c.name)
+  assert.deepEqual(names, expect)
+})
+
+check("rankCommands 按最近使用置顶", () => {
+  const mru = { dense: 300, themes: 100 }
+  const names = rankCommands("", mru).map((c) => c.name)
+  assert.ok(names.indexOf("dense") < names.indexOf("themes"), "dense 用过应排前")
+  assert.ok(names.indexOf("themes") < names.indexOf("new"), "空 query 下只用过的提前, 其余保序")
+})
+
+check("rankCommands 过滤+排序共存", () => {
+  const mru = { statusline: 500, status: 100 }
+  const names = rankCommands("status", mru).map((c) => c.name)
+  assert.deepEqual(names, ["statusline", "status"], "desc 匹配的 status 也参与, 用过优先")
 })
 
 // ---------- 鼠标代理(SGR 剥离, 修复"点击往输入框打 [<0;12;34M") ----------

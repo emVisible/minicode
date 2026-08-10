@@ -1,6 +1,6 @@
 {
   "name": "minicode",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "终端里的对话式 LLM 聊天工具: SSE 流式 + 全屏 TUI + 命令行模式 + 项目内缓存, 无工具调用",
   "bin": {
@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "smoke:ui": "tsx test/ui-utils.ts",
     "smoke:tui": "tsx test/tui-e2e.ts",
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "check": "npm run typecheck && npm run smoke && npm run smoke:ui && npm run smoke:tui && npm run build"
   },
   "engines": {
     "node": ">=20.12"

@@ -10,16 +10,23 @@ Mini opencode: 一个终端里的对话式 LLM 聊天工具。核心链路(LLM S
 
 配置通过 `LLM_URL` / `LLM_API_KEY` / `LLM_MODEL` 环境变量,或独立设置面板(`Ctrl+o`, 首启自动打开),持久化到项目内 `.minicode/config.json`。
 
-## 已实现(v0.6.4)
+## 已实现(v0.7 体验版)
 
 ### 交互与快捷键
 
+- **状态行**(底部一行, 默认开, `/statusline` 关): `model · ↑in ↓out · 今日 tokens · 会话时长`, 随时看到"正在用什么/烧了多少/这轮多久"
+- **`/status` 会话总览**: provider/model/url · 会话 id/消息数/时长 · 上下文占用 %(≥70% 提醒一次、≥90% 再提醒, 催 `/compact`) · 本会话/今日/累计用量 · 开关状态
+- **输入历史 `Ctrl+↑/↓`**: 回填之前提交过的输入(最新在前), 向下越界还原草稿
+- **长回答完成通知**(默认开, `/notify` 关): ≥8s 的回答完成后终端响铃 + 桌面通知(OSC 9)
+- **会话归档**: `/archive` 归档当前会话, `/archived` 查看恢复, 会话面板 `a` 键单键切换; `--resume` 不碰已归档会话
+- **命令 MRU**: 面板里最近执行过的命令自动靠前(会话级)
 - **Ctrl+C 双击退出**(唯一退出方式): 忙碌时单次取消请求, 3s 内再按退出
 - **Esc 只取消不退出**: 关闭面板/中断请求/退出命令行模式; 绝不退出(用户要求: 防止误触)
 - **命令面板**(`Ctrl+P` 或输入框首字符 `/`): 全界面唯一的命令入口 —— 所有命令分组展示, 打字即过滤, ↑↓ 选择, Enter 执行; 会话恢复也走面板(ctrl+x `l`)
 - **Tab 切换 对话/命令行 模式**: 命令行模式输入直接作为 shell 命令执行(`cwd` 运行, 30s 超时熔断, 输出回显为结论块); 自动阻止"在命令行模式里再起 minicode"的嵌套
 - **危险命令闸门**(`src/danger.ts`): 命令行模式先静态检查 —— rm 根/家目录、.git/.minicode 删除、管道执行远端脚本、git push --force、磁盘级操作、关机重启等命中时**不执行**, 弹单键确认 `y` 执行一次 · `a` 本会话放行 · `Esc` 取消
 - **用量统计**(`src/usage.ts`): 自动按会话/按天记录 token 与轮次(落盘 `.minicode/usage.json`); 每次回答 verdict 附 `↑in ↓out · 耗时`; `/usage` 展示 本会话/今日/累计
+- **终端标题联动**: 流式期间标题显示 `minicode · model · cwd`, 结束/退出还原
 - **Ctrl+x 领衔快捷键**(静默执行, 全表见命令面板): `n`新会话 `l`会话列表 `t`主题 `m`模型 `e`编辑器 `c`复制最后回答 `v`复制我的问题 `x`导出 `d`诊断 `g`间距 `u`用量 `f`分支 `o`provider `p`帮助 `q`退出
 - **提示静默**: 常规界面上不再推送操作提示(模式切换/取消/Esc 等均为静默操作), 需要查询一律进命令面板
 - **剪贴板复制**(`src/clipboard.ts`): mac pbcopy / win clip / linux xclip-xsel 自动适配
@@ -28,11 +35,12 @@ Mini opencode: 一个终端里的对话式 LLM 聊天工具。核心链路(LLM S
 - **聊天气泡**: 我的消息右对齐气泡(宽度随内容自适应), 回答左对齐; `/dense` 切换紧凑/宽松间距(持久化)
 - **长输入预览**: 输入过长时自动弹独立预览窗(Enter 确认发送 · Esc 收起继续编辑)
 - **IME 光标**: 真实终端光标钉在输入位(useCursor), 中文输入法组合条不漂移; `/themes` 主题切换持久化到配置
+- 429 限流/额度耗尽的错误文案附今日用量与可行动作; `/update` 显示版本与升级方式
 
 ### 项目内缓存
 
 - 数据目录 `<cwd>/.minicode/`(`MINICODE_HOME` 可覆盖): 配置/会话/日志全部项目内, 多项目隔离
-- 启动自动创建; 会话防抖 800ms 落盘 `.minicode/sessions/`; 命令面板会话页(ctrl+x `l` / `/sessions`)列出并恢复, 支持 `d` 删除(二次确认) / `r` 重命名; `/fork` 把当前会话复制为分支; `-r/--resume` 恢复最近(可 `--resume=<id>`, headless 亦可续问并落回原会话)
+- 启动自动创建; 会话防抖 800ms 落盘 `.minicode/sessions/`; 命令面板会话页(ctrl+x `l` / `/sessions`)列出并恢复, 支持 `d` 删除(二次确认) / `r` 重命名 / `a` 归档;`/fork` 把当前会话复制为分支; `/archive` 归档当前会话, `/archived` 查看恢复; `-r/--resume` 恢复最近(跳过已归档, 可 `--resume=<id>`, headless 亦可续问并落回原会话)
 - 日志 `.minicode/logs/minicode-YYYYMMDD.log`(按天 + 2MB 轮转); 崩溃兜底; TUI 内 `/log` 回显
 
 ### 对话 LLM
@@ -94,12 +102,15 @@ src/
   log.ts              日志体系(分级/落盘/轮转/崩溃兜底)
   clipboard.ts        剪贴板适配(pbcopy/clip/xclip)
   console-patch.ts    TUI 期间 console.* 重定向到日志
-  commands.ts         命令注册表(单一来源: / 命令 + ctrl+x 领衔键 + 命令面板)
+  commands.ts         命令注册表(单一来源: / 命令 + ctrl+x 领衔键 + 命令面板 + MRU 排序)
   danger.ts           危险命令静态闸门(命令行模式执行前检查)
   usage.ts            用量账本(会话/按天 token 聚合, /usage)
-  ui/app.tsx          TUI 主(消息流/打字机/Ctrl+C/Esc 语义/双模式/命令分发)
+  input-history.ts    输入历史纯函数(Ctrl+↑/↓ 回填)
+  version.ts          版本常量(与 package.json / dist banner 同源)
+  ui/app.tsx          TUI 主(消息流/打字机/Ctrl+C/Esc 语义/双模式/命令分发/状态行/context 提醒)
+  ui/statusline.tsx   底部状态行组件(时长/用量格式化)
   ui/settings.tsx     独立配置面板
-  ui/palette.tsx      命令面板(全界面唯一的提示区)
+  ui/palette.tsx      命令面板(全界面唯一的提示区, 会话页支持归档)
 scripts/build.mjs      esbuild 单文件打包(dist/minicode.mjs)
 install.sh            交互安装(构建 + 全局注册 + PATH)
 ```
@@ -107,12 +118,14 @@ install.sh            交互安装(构建 + 全局注册 + PATH)
 ## 验证门禁
 
 ```
-pnpm typecheck && pnpm smoke && pnpm smoke:ui && pnpm smoke:tui
+pnpm check
 ```
 
-- smoke: 路径解析(MINICODE_HOME)/配置原子写·权限·往返·env 优先/provider 快照/SSE 聚合/上下文/重试/非流式/中断/会话 CRUD 与用量/headless --json 与 --stream-json(39 断言)
-- ui-utils: 视口/滚动/命令表/鼠标/危险命令规则(18 断言)
-- tui-e2e: 真 PTY 驱动 —— 消息→流式回答→落盘→双击退出;Esc 不退出;Tab 命令行模式执行;危险命令确认闸门(13 断言)
+(等价 `pnpm typecheck && pnpm smoke && pnpm smoke:ui && pnpm smoke:tui && pnpm build`)
+
+- smoke: 路径解析(MINICODE_HOME)/配置原子写·权限·往返·env 优先/v0.7 体验开关持久化/provider 快照/SSE 聚合/上下文/重试/非流式/中断/会话 CRUD 与归档/用量/headless --json 与 --stream-json(46 断言)
+- ui-utils: 视口/滚动/命令表/鼠标/危险命令规则/状态行纯函数/输入历史/MRU(28 断言)
+- tui-e2e: 真 PTY 驱动 —— 消息→流式回答→落盘→双击退出;Esc 不退出;Tab 命令行执行;危险命令确认闸门;状态行与 /statusline / /status;慢速回答完成通知(20 断言)
 
 ## 未实现(明确不做/后续)
 

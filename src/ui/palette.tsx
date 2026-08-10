@@ -30,6 +30,7 @@ export function PalettePanel({
   sel,
   rows,
   sessions,
+  archivedScope,
 }: {
   t: ThemeTokens
   phase: "commands" | "sessions"
@@ -38,15 +39,16 @@ export function PalettePanel({
   sel: number
   rows: PaletteRow[]
   sessions: SessionRow[]
+  archivedScope?: boolean
 }): ReactNode {
   const renaming = phase === "sessions" && mode === "rename"
   return (
     <Box flexDirection="column" width="100%" marginTop={1} borderStyle="single" borderColor={t.accentDim} paddingX={1} paddingY={1}>
       <Box flexDirection="row">
         <Text color={t.accent} bold>
-          ⌘ {renaming ? "重命名" : phase === "sessions" ? "会话" : "命令"}
+          ⌘ {renaming ? "重命名" : phase === "sessions" ? (archivedScope ? "已归档会话" : "会话") : "命令"}
         </Text>
-        <Text color={t.inkDim}>　{renaming ? "输入新名字 · Enter 保存 · Esc 取消" : phase === "sessions" ? `历史会话 (${sessions.length}) — Enter 恢复 · d 删 · r 改名` : `命令 (${rows.length}) — 过滤 · Enter 执行 · Esc 关闭`}</Text>
+        <Text color={t.inkDim}>　{renaming ? "输入新名字 · Enter 保存 · Esc 取消" : phase === "sessions" ? (archivedScope ? `已归档 (${sessions.length}) — Enter 恢复 · a 取消归档` : `历史会话 (${sessions.length}) — Enter 恢复 · d 删 · r 改名 · a 归档`) : `命令 (${rows.length}) — 过滤 · Enter 执行 · Esc 关闭`}</Text>
       </Box>
       <Box marginTop={1}>
         <Text color={t.ink} wrap="wrap">
@@ -87,7 +89,7 @@ export function PalettePanel({
             ))
           )
         ) : sessions.length === 0 ? (
-          <Text color={t.inkFaint}>还没有保存的会话</Text>
+          <Text color={t.inkFaint}>{archivedScope ? "还没有已归档的会话(/sessions 列表可 a 归档)" : "还没有保存的会话"}</Text>
         ) : (
           sessions.slice(0, PALETTE_MAX_ROWS).map((s, i) => (
             <Box key={s.id} flexDirection="row">

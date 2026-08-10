@@ -31,9 +31,18 @@ export interface MinicodeConfig {
   providers?: Record<string, ProviderProfile>
   /** 当前 provider(缺省 "default") */
   provider?: string
+  /** 底部状态行开关(v0.7, 默认开) */
+  statusline?: boolean
+  /** 上下文窗口上限(tokens), 用于 context 占用提醒; 默认 32000 */
+  contextLimit?: number
+  /** 长回答完成后终端通知(BEL/OSC9, 默认开) */
+  notify?: boolean
 }
 
 export const DEFAULT_PROVIDER = "default"
+
+/** context 提醒/状态行的窗口上限默认值(tokens) */
+export const DEFAULT_CONTEXT_LIMIT = 32_000
 
 export function configPath(cwd?: string): string {
   return process.env.MINICODE_CONFIG || configFile(cwd)
@@ -50,6 +59,9 @@ function readRaw(cwd?: string): MinicodeConfig {
     if (raw.theme === "dark" || raw.theme === "light") out.theme = raw.theme
     if (typeof raw.dense === "boolean") out.dense = raw.dense
     if (typeof raw.provider === "string" && raw.provider.trim()) out.provider = raw.provider.trim()
+    if (typeof raw.statusline === "boolean") out.statusline = raw.statusline
+    if (typeof raw.contextLimit === "number" && raw.contextLimit > 0) out.contextLimit = raw.contextLimit
+    if (typeof raw.notify === "boolean") out.notify = raw.notify
     if (raw.providers && typeof raw.providers === "object") {
       out.providers = {}
       for (const [name, p] of Object.entries(raw.providers as Record<string, unknown>)) {
@@ -102,6 +114,9 @@ export function loadConfig(cwd?: string): MinicodeConfig {
   const out: MinicodeConfig = {}
   if (raw.theme) out.theme = raw.theme
   if (typeof raw.dense === "boolean") out.dense = raw.dense
+  if (typeof raw.statusline === "boolean") out.statusline = raw.statusline
+  if (typeof raw.contextLimit === "number" && raw.contextLimit > 0) out.contextLimit = raw.contextLimit
+  if (typeof raw.notify === "boolean") out.notify = raw.notify
   if (prof.url || raw.llmUrl) out.llmUrl = prof.url || raw.llmUrl
   if (prof.apiKey || raw.llmApiKey) out.llmApiKey = prof.apiKey || raw.llmApiKey
   if (prof.model || raw.llmModel) out.llmModel = prof.model || raw.llmModel
@@ -148,6 +163,9 @@ export function saveConfig(cfg: MinicodeConfig, cwd?: string): void {
   if (cfg.llmModel !== undefined) raw.llmModel = cfg.llmModel
   if (cfg.theme) raw.theme = cfg.theme
   if (typeof cfg.dense === "boolean") raw.dense = cfg.dense
+  if (typeof cfg.statusline === "boolean") raw.statusline = cfg.statusline
+  if (typeof cfg.contextLimit === "number" && cfg.contextLimit > 0) raw.contextLimit = cfg.contextLimit
+  if (typeof cfg.notify === "boolean") raw.notify = cfg.notify
   if (cfg.providers) raw.providers = cfg.providers
   saveRaw(raw, cwd)
 }

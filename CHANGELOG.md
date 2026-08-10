@@ -4,6 +4,25 @@
 
 ## [Unreleased]
 
+### 2026-08-10 v0.7 体验版 —— 对标 Claude Code statusline / Codex /status·/title·notify
+
+**P0 状态行 / context 提醒 / /status**
+- **状态行**(默认开, `/statusline` 关): 底部一行 `model · ↑in ↓out · 今日 tokens · 会话时长`, 1s 节拍; 计入视口预留, 关闭即销毁定时器
+- **context 占用提醒**: 配置 `contextLimit`(默认 32000); 每轮取最近 inputTokens 估算占用, 70% 提醒一次(/compact 可推迟)、90% 再提醒一次, /compact 与 /new 后归零重计
+- **`/status` 会话总览**: provider · model · url / session id · 消息数 · 已用时长 / 上下文占用 % / 本会话·今日·累计用量 / 各种开关状态; `/models` `/usage` 保留原语义
+
+**P1 体验细节**
+- **输入历史 `Ctrl+↑/↓`**: 回填已提交输入(最新在前, 去重置顶, 上限 50), 向下越界还原草稿, /new 清空; 纯函数 `walkHistory`/`rememberInput` 可单测
+- **长回答完成通知**(默认开, `/notify` 关): ≥8s 的回答完成后 BEL + OSC 9 终端/桌面通知, 中断与失败不打扰
+- **终端标题联动**: 流式期间标题 `minicode · model · cwd`, 结束/退出还原
+- **会话归档**: `/archive` 归档当前会话, `/archived` 查看并恢复(Enter 恢复即取消归档), 会话面板 `a` 键单键切换归档; `--resume` 不会恢复已归档会话
+
+**P2 打磨**
+- 命令面板 MRU 排序(最近执行过的命令靠前, 会话级内存)
+- 429 限流人性化文案(附今日用量与可行动作)
+- `/update` 版本信息与本地更新提示; package.json 升 0.7.0, dist banner 注入 `v0.7.0` 版本标记
+- `pnpm check` 一键门禁: typecheck + smoke(46) + smoke:ui(28) + smoke:tui(20) + build 全绿
+
 ### 2026-08-10 v0.6.4 多 provider 与 headless 结构化输出
 - **多 provider 快照**: 配置支持 `providers: {名字: {url, apiKey, model}}` + `provider: 当前名`; 顶层 llm* 字段视为 "default" 快照(向后兼容, 自动折算); 生效优先级: 环境变量 > 当前快照 > 遗留顶层字段
 - **`/provider`**: 无参列出全部 provider 与当前项; 带参创建(必要时)并切换, 立即重算进程 env(用户自设 env 恒优, 本模块注入的 env 在切换时撤销); 设置面板页头显示当前 provider, 保存写入当前快照; 头部模型标签在非 default 时显示 `provider · model`

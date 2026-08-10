@@ -58,6 +58,39 @@ function startMock(port: number): Promise<{ close: () => void }> {
   })
 }
 
+/** 慢速假 LLM: 首字符延迟 delayMs, 用于长回答完成通知(≥8s)场景 */
+function startSlowMock(port: number, delayMs: number): Promise<{ close: () => void }> {
+  const text = "慢速回答: 完成了。"
+  const server = createServer((req, res) => {
+    let raw = ""
+    req.on("data", (c) => (raw += c))
+    req.on("end", () => {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
+        let i = 0
+        const iv = setInterval(() => {
+          i += 2
+          if (i <= text.length) {
+            try {
+              res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: text.slice(i - 2, i) }, index: 0 }] })}\n\n`)
+            } catch {}
+          } else {
+            clearInterval(iv)
+            try {
+              res.write(`data: ${JSON.stringify({ choices: [{ finish_reason: "stop", index: 0 }], usage: {} })}\n\n`)
+              res.write("data: [DONE]\n\n")
+              res.end()
+            } catch {}
+          }
+        }, 30)
+      }, delayMs)
+    })
+  })
+  return new Promise((resolve) => {
+    server.listen(port, "127.0.0.1", () => resolve({ close: () => server.close() }))
+  })
+}
+
 // ---------- python3 PTY 驱动 ----------
 
 const PY_DRIVER = `
@@ -69,6 +102,7 @@ post = float(sys.argv[3])
 esc_first = len(sys.argv) > 4 and sys.argv[4] == "esc"
 tab_first = len(sys.argv) > 4 and sys.argv[4] == "tab"
 danger_first = len(sys.argv) > 4 and sys.argv[4] == "danger"
+status_probe = len(sys.argv) > 4 and sys.argv[4] == "status"
 
 def set_size(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -113,6 +147,16 @@ try:
         pump(post)
         os.write(fd, b"\\x1b")
         pump(1.0)
+    elif status_probe:
+        # 场景 E: 默认状态行可见 → /statusline 关闭 → /status 总览
+        os.write(fd, b"/statusline")
+        pump(0.2)
+        os.write(fd, b"\\r")
+        pump(1.2)
+        os.write(fd, b"/status")
+        pump(0.2)
+        os.write(fd, b"\\r")
+        pump(1.5)
     else:
         if esc_first:
             # 场景 B: 先按 Esc(应显示"取消"提示而不是退出), 再正常聊天
@@ -157,12 +201,13 @@ interface RunResult {
   driverErr: string
 }
 
-function runTui({ warmup, post, home, llmUrl, escFirst, tabFirst, dangerFirst }: { warmup: number; post: number; home: string; llmUrl: string; escFirst?: boolean; tabFirst?: boolean; dangerFirst?: boolean }): Promise<RunResult> {
+function runTui({ warmup, post, home, llmUrl, escFirst, tabFirst, dangerFirst, statusFirst }: { warmup: number; post: number; home: string; llmUrl: string; escFirst?: boolean; tabFirst?: boolean; dangerFirst?: boolean; statusFirst?: boolean }): Promise<RunResult> {
   const outPath = join(tmpdir(), `tui-capture-${Date.now()}.txt`)
   const args = ["-c", PY_DRIVER, outPath, String(warmup), String(post)]
   if (escFirst) args.push("esc")
   if (tabFirst) args.push("tab")
   if (dangerFirst) args.push("danger")
+  if (statusFirst) args.push("status")
   return new Promise((resolve) => {
     const child = spawn("python3", args, {
       env: {
@@ -273,12 +318,55 @@ async function scenarioD(): Promise<void> {
   rmSync(home, { recursive: true, force: true })
 }
 
+// ---------- 场景 E: v0.7 状态行 / /statusline / /status ----------
+
+async function scenarioE(): Promise<void> {
+  console.log("\nE: 状态行默认开 → /statusline 关闭 → /status 总览")
+  const home = mkdtempSync(join(tmpdir(), "tui-home-"))
+  const mock = await startMock(9735)
+  const r = await runTui({
+    warmup: 3.0,
+    post: 5.0,
+    home,
+    llmUrl: "http://127.0.0.1:9735/v1/chat/completions",
+    statusFirst: true,
+  })
+  mock.close()
+  const out = r.out
+  check("E1 默认底部状态行可见(model + 会话 tokens)", out.includes("mock") && out.includes("↑0 ↓0"), JSON.stringify(out.split("\n").filter((l) => l.includes("↑0 ↓0")).slice(-2)))
+  check("E2 /statusline 切换有确认提示", out.includes("状态行已关闭"), out.slice(-500))
+  check("E3 /status 总览含上下文占用与开关状态", out.includes("会话总览") && out.includes("上下文占用") && out.includes("状态行: 关"), out.slice(-700))
+  check("E4 双击 Ctrl+C 退出", r.exitCode === 0, `exit=${r.exitCode}`)
+  rmSync(home, { recursive: true, force: true })
+}
+
+// ---------- 场景 F: 长回答(≥8s)完成通知(BEL) ----------
+
+async function scenarioF(): Promise<void> {
+  console.log("\nF: 慢速回答 → 完成时终端通知(BEL)")
+  const home = mkdtempSync(join(tmpdir(), "tui-home-"))
+  const mock = await startSlowMock(9736, 9_000)
+  const r = await runTui({
+    warmup: 2.5,
+    post: 12.0,
+    home,
+    llmUrl: "http://127.0.0.1:9736/v1/chat/completions",
+  })
+  mock.close()
+  check("F1 慢速回答完成(BEL 通知序列已发射)", r.out.includes("\u0007"), `BEL present: ${r.out.includes("\u0007")} · 尾部: ${r.out.slice(-120)}`)
+  check("F2 回答文本落入会话", r.out.includes("慢速回答"), r.out.slice(0, 200))
+  check("F3 双击 Ctrl+C 退出", r.exitCode === 0, `exit=${r.exitCode}`)
+  rmSync(home, { recursive: true, force: true })
+}
+
 async function main(): Promise<void> {
   console.log("TUI e2e (PTY)")
   await scenarioA()
   await scenarioB()
   await scenarioC()
   await scenarioD()
+  await scenarioE()
+  await scenarioF()
   console.log(`\nTUI e2e: ${passed} passed, ${failed} failed`)
   process.exit(failed > 0 ? 1 : 0)
 }

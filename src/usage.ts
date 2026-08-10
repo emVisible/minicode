@@ -107,15 +107,19 @@ export function usageSummary(): { today: DayUsage; days: Array<{ day: string; us
 export function usageDetailLines(sessionId: string): string[] {
   const s = sessionUsage(sessionId)
   const { today, days } = usageSummary()
-  const fmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
   const lines: string[] = []
   lines.push(
     s
-      ? `本次会话: ${s.turns} 轮 · 输入 ${fmt(s.inputTokens)} · 输出 ${fmt(s.outputTokens)}`
+      ? `本次会话: ${s.turns} 轮 · 输入 ${fmtTokens(s.inputTokens)} · 输出 ${fmtTokens(s.outputTokens)}`
       : "本次会话: 尚无 LLM 调用(命令行模式不计入)",
   )
-  lines.push(`今日: ${today.turns} 轮 · 输入 ${fmt(today.inputTokens)} · 输出 ${fmt(today.outputTokens)}`)
-  const recent = days.length ? `${days[0]!.day} · ${fmt(days[0]!.usage.inputTokens + days[0]!.usage.outputTokens)} tokens` : "无记录"
+  lines.push(`今日: ${today.turns} 轮 · 输入 ${fmtTokens(today.inputTokens)} · 输出 ${fmtTokens(today.outputTokens)}`)
+  const recent = days.length ? `${days[0]!.day} · ${fmtTokens(days[0]!.usage.inputTokens + days[0]!.usage.outputTokens)}` : "无记录"
   lines.push(`累计: ${recent}`)
   return lines
+}
+
+/** 千分位友好的 token 格式化(1.2k / 340), 状态行与展示行共用 */
+export function fmtTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 }

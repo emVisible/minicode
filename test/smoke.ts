@@ -8,7 +8,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { LLMClient } from "../src/llm.ts"
 import { loadConfig, saveConfig, applyConfigToEnv, configPath, switchProvider, activeProvider, listProviders, saveProviderProfile, resetForcedEnv, registerForcedEnv, DEFAULT_PROVIDER } from "../src/config.ts"
-import { saveSession, listSessions, loadSession, deleteSession, renameSession, forkSession, newSessionId, latestSession, sessionsDirPath } from "../src/session.ts"
+import { saveSession, listSessions, loadSession, deleteSession, renameSession, forkSession, newSessionId, latestSession, sessionsDirPath, setArchived } from "../src/session.ts"
 import { recordUsage, sessionUsage, usageSummary, usageDetailLines, usageDayKey, flushUsage } from "../src/usage.ts"
 import { homePath, configFile, ensureHome, sessionsDir } from "../src/paths.ts"
 import type { ChatMessage } from "../src/types.ts"
@@ -175,6 +175,17 @@ process.env.LLM_URL = "http://direct/v1"
   process.env.LLM_URL = ""
   delete process.env.LLM_PROVIDER
   switchProvider(DEFAULT_PROVIDER)
+
+  // ---------- v0.7 体验开关持久化 ----------
+  saveConfig({ statusline: false, notify: false, contextLimit: 16000 })
+  let v07 = loadConfig()
+  check("v0.7 开关可持久化", v07.statusline === false && v07.notify === false && v07.contextLimit === 16000, JSON.stringify(v07))
+  saveConfig({ statusline: true, notify: true })
+  v07 = loadConfig()
+  check("v0.7 开关回开后互不覆盖", v07.statusline === true && v07.notify === true && v07.contextLimit === 16000, JSON.stringify(v07))
+  const def = loadConfig()
+  saveConfig(def)
+  check("loadConfig 顶层体验字段往返(保存后仍可读)", loadConfig().statusline === true && loadConfig().contextLimit === 16000)
 }
 
 // ---------- LLM 流式 ----------
@@ -310,6 +321,25 @@ function testSession(): void {
   deleteSession(id)
   check("会话可删除", listSessions().every((s) => s.id !== id))
   deleteSession(fork!.id)
+
+  // ---------- v0.7 归档(可逆) ----------
+  const aid = newSessionId("smoke")
+  saveSession({
+    id: aid,
+    cwd: "/tmp",
+    model: "mock",
+    createdAt: 1700000000000,
+    msgs: [{ kind: "user", text: "归档测试", ts: 1700000000000 }],
+    history: [],
+  })
+  check("归档前列表可见且未标记", listSessions().find((s) => s.id === aid)?.archived === false)
+  setArchived(aid, true)
+  check("归档后标记生效", listSessions().find((s) => s.id === aid)?.archived === true)
+  const latest2 = latestSession()
+  check("归档后 --resume 不再选中它", latest2 === null || latest2.id !== aid)
+  setArchived(aid, false)
+  check("取消归档后恢复", listSessions().find((s) => s.id === aid)?.archived === false)
+  deleteSession(aid)
 }
 
 // ---------- 用量账本 ----------
