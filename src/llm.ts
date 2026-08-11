@@ -2,7 +2,7 @@
 // 端点: url 参数 > LLM_URL 环境变量; 鉴权: LLM_API_KEY / API_KEY; 模型: LLM_MODEL
 // 纯文本流式聚合 content, 支持超时、退避重试、AbortSignal 中断
 
-import type { ChatMessage, LLMStreamOpts, StreamFinish, StreamResult, Usage } from "./types.ts"
+import type { ChatMessage, LLMStreamOpts, StreamEvent, StreamFinish, StreamResult, Usage } from "./types.ts"
 
 const DEFAULT_MODEL = "gpt-4o-mini"
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -66,7 +66,7 @@ export class LLMClient {
     apiKey?: string
     body: Record<string, unknown>
     signal?: AbortSignal
-    onDelta?: (e: { type: "text-delta"; text: string }) => void
+    onDelta?: (e: StreamEvent) => void
   }): Promise<StreamResult> {
     const timeoutSignal = AbortSignal.timeout(this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
     const signal = opts.signal ? AbortSignal.any([opts.signal, timeoutSignal]) : timeoutSignal
@@ -106,8 +106,10 @@ export class LLMClient {
       const msg = json.choices?.[0]?.message
       const ttft = performance.now() - t0
       const usage = toUsage(json)
+      // 思考型模型(如 DeepSeek)可能把整段回答放进 reasoning_content, content 反而为空
+      const content = msg?.content ?? msg?.reasoning_content ?? ""
       return {
-        message: { role: "assistant", content: msg?.content ?? "" },
+        message: { role: "assistant", content },
         finish: (json.choices?.[0]?.finish_reason as StreamFinish) ?? "stop",
         usage,
         ttft,
@@ -116,11 +118,13 @@ export class LLMClient {
     }
 
     let text = ""
+    let think = ""
     let finish: StreamFinish = "stop"
     let usage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
 
-    const timedDelta = (e: { type: "text-delta"; text: string }) => {
+    const timedDelta = (e: StreamEvent) => {
       if (!firstTokenAt) firstTokenAt = performance.now()
+      if (e.type === "think-delta") think += e.text
       opts.onDelta?.(e)
     }
     await this.readSSE(res, {
@@ -132,8 +136,10 @@ export class LLMClient {
     const total = performance.now() - t0
     const ttft = firstTokenAt ? firstTokenAt - t0 : total
     const outTokens = text.length / 4
+    // 思考型模型(DeepSeek 等)整段回答在 reasoning_content 里, content 为空 → 回退用思考文本
+    const content = text || think
     return {
-      message: { role: "assistant", content: text },
+      message: { role: "assistant", content },
       finish,
       usage,
       ttft,
@@ -144,7 +150,7 @@ export class LLMClient {
   private async readSSE(
     res: Response,
     handlers: {
-      onDelta: (e: { type: "text-delta"; text: string }) => void
+      onDelta: (e: StreamEvent) => void
       onText: (t: string) => void
       onFinish: (f: StreamFinish) => void
       onUsage: (u: Usage) => void
@@ -206,7 +212,7 @@ export class LLMClient {
   private parseChunk(
     data: string,
     handlers: {
-      onDelta: (e: { type: "text-delta"; text: string }) => void
+      onDelta: (e: StreamEvent) => void
       onText: (t: string) => void
       onFinish: (f: StreamFinish) => void
       onUsage: (u: Usage) => void
@@ -223,6 +229,9 @@ export class LLMClient {
     if (delta?.content) {
       handlers.onText(delta.content)
       handlers.onDelta({ type: "text-delta", text: delta.content })
+    } else if (delta?.reasoning_content) {
+      // 思考型模型(DeepSeek 系): 回答在 reasoning_content, content 全程为 null
+      handlers.onDelta({ type: "think-delta", text: delta.reasoning_content })
     }
     if (choice?.finish_reason) handlers.onFinish(choice.finish_reason as StreamFinish)
     if (json.usage) handlers.onUsage(toUsage(json))

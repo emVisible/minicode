@@ -176,7 +176,7 @@ async function runMain(): Promise<number> {
     const restore = (): void => {
       if (restored || !isTty) return
       restored = true
-      process.stdout.write("\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1006l")
+      process.stdout.write("\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")
     }
     process.on("exit", restore)
     process.on("exit", restoreConsole)
@@ -189,7 +189,7 @@ async function runMain(): Promise<number> {
       const created = createMouseFilterStdin(process.stdin, () => {})
       stdin = created.stdin as typeof process.stdin
       mouseBus = created.bus
-      process.stdout.write("\x1b[?1000h\x1b[?1006h")
+      process.stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h")
     }
     const instance = render(
       createElement(App, { cwd: flags.cwd, theme: theme ?? undefined, resume: flags.resume, mouseBus }),

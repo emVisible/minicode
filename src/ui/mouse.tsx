@@ -14,6 +14,8 @@ export interface MouseEventData {
   col: number
   /** 0=左键, 1=中键, 2=右键; 64=滚轮上, 65=滚轮下 */
   button: number
+  /** 按下事件(M); false 表示释放/点击完成(m, 部分终端只发释放) */
+  release: boolean
   /** 按住时是否带修饰键(shift/alt/ctrl, 编码在 b 的高位) */
   ctrl: boolean
   shift: boolean
@@ -30,12 +32,12 @@ export function parseMouseSeq(seq: string): MouseEventData | null {
   // SGR: \x1b[<b;r;cM (按下) / \x1b[<b;r;cm (释放)
   const sgr = seq.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/)
   if (sgr) {
-    if (sgr[4] === "m") return null // 释放, 忽略
     const raw = Number(sgr[1])
     return {
       row: Number(sgr[2]),
       col: Number(sgr[3]),
       button: raw >= 64 ? (raw >= 65 ? 65 : 64) : raw & 0b11,
+      release: sgr[4] === "m",
       ctrl: (raw >> 4 & 1) === 1,
       shift: (raw >> 2 & 1) === 1,
       alt: (raw >> 3 & 1) === 1,
@@ -46,11 +48,11 @@ export function parseMouseSeq(seq: string): MouseEventData | null {
   if (x10) {
     const [b, r, c] = x10[1]!.split("").map((ch) => ch.charCodeAt(0) - 32)
     const raw = b ?? 0
-    if ((raw & 0b11) === 3) return null // 释放
     return {
       row: r ?? 0,
       col: c ?? 0,
       button: raw >= 64 ? (raw >= 65 ? 65 : 64) : raw & 0b11,
+      release: (raw & 0b11) === 3,
       ctrl: (raw >> 4 & 1) === 1,
       shift: (raw >> 2 & 1) === 1,
       alt: (raw >> 3 & 1) === 1,
@@ -75,7 +77,20 @@ export function createMouseFilterStdin(
       return () => listeners.delete(cb)
     },
   }
+  // 按下事件的最近位置: 用于对"按下+释放"事件对去重(释放只当作兜底,
+  // 某些终端只发释放 m 而不发按下 M, 此时单独到达的释放视为一次点击)
+  let lastPress: { row: number; col: number; ts: number } | null = null
   const deliver = (e: MouseEventData): void => {
+    if (!e.release) {
+      if (e.button <= 2) lastPress = { row: e.row, col: e.col, ts: Date.now() }
+      onMouse(e)
+      for (const cb of listeners) cb(e)
+      return
+    }
+    const p = lastPress
+    if (p && p.row === e.row && p.col === e.col && Date.now() - p.ts < 500) {
+      return // 与按下配对: 按下已触发, 释放丢弃
+    }
     onMouse(e)
     for (const cb of listeners) cb(e)
   }

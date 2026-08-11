@@ -35,7 +35,7 @@ export function displayWidth(s: string): number {
   return w
 }
 
-function truncateTo(s: string, w: number): string {
+export function truncateTo(s: string, w: number): string {
   let out = ""
   let dw = 0
   for (const ch of s) {

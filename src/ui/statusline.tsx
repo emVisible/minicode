@@ -15,8 +15,8 @@ export function formatDuration(ms: number): string {
   return `${m}:${p(s)}`
 }
 
-export function StatusLine(props: { t: ThemeTokens; model: string; sessionId: string; sinceMs: number }): ReactNode {
-  const { t, model, sessionId, sinceMs } = props
+export function StatusLine(props: { t: ThemeTokens; model: string; sessionId: string; sinceMs: number; width?: number }): ReactNode {
+  const { t, model, sessionId, sinceMs, width } = props
   const s = sessionUsage(sessionId)
   const { today } = usageSummary()
   const parts = [
@@ -25,10 +25,12 @@ export function StatusLine(props: { t: ThemeTokens; model: string; sessionId: st
     `今日 ${fmtTokens(today.inputTokens + today.outputTokens)}`,
     formatDuration(Date.now() - sinceMs),
   ]
+  // 单行封顶(截断, 不换行): 状态行绝不允许让整帧高度 +1
+  const text = [...parts.join(" · ")].slice(0, Math.max(1, (width ?? 80) - 2)).join("")
   return (
     <Box flexDirection="row" width="100%">
-      <Text color={t.inkFaint} dimColor wrap="wrap">
-        {parts.join(" · ")}
+      <Text color={t.inkFaint} dimColor>
+        {text}
       </Text>
     </Box>
   )

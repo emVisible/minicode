@@ -14,7 +14,7 @@ export interface ChatMessage {
 
 export type StreamFinish = "stop" | "length" | "content_filter" | "error" | "aborted"
 
-export type StreamEvent = { type: "text-delta"; text: string }
+export type StreamEvent = { type: "text-delta"; text: string } | { type: "think-delta"; text: string }
 
 export interface Usage {
   inputTokens: number
@@ -43,7 +43,8 @@ export interface StreamResult {
 
 export type ChatMsg =
   | { kind: "user"; text: string; ts: number }
-  | { kind: "assistant"; text: string; ts: number }
+  /** think: 模型的思考过程(reasoning_content, DeepSeek 系), 落库保留供用户展开查看 */
+  | { kind: "assistant"; text: string; think?: string; ts: number }
   | { kind: "verdict"; text: string; ok: boolean; detail?: string[]; ts: number }
   | { kind: "danger"; text: string; detail?: string[]; ts: number }
   | { kind: "info"; text: string; detail?: string[]; ts: number }

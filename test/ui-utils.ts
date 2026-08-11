@@ -201,9 +201,28 @@ check("rankCommands 过滤+排序共存", () => {
 check("parseMouseSeq SGR 按下/释放/滚轮", () => {
   const press = parseMouseSeq("\x1b[<0;12;34M")!
   assert.deepEqual({ button: press.button, row: press.row, col: press.col }, { button: 0, row: 12, col: 34 })
-  assert.equal(parseMouseSeq("\x1b[<0;12;34m"), null, "释放事件应忽略")
+  assert.equal(press.release, false, "M 结尾是按下")
+  const rel = parseMouseSeq("\x1b[<0;12;34m")!
+  assert.deepEqual({ button: rel.button, row: rel.row, col: rel.col }, { button: 0, row: 12, col: 34 }, "释放事件应解析")
+  assert.equal(rel.release, true, "m 结尾是释放")
   assert.equal(parseMouseSeq("\x1b[<64;5;10M")!.button, 64)
   assert.equal(parseMouseSeq("\x1b[<65;5;10M")!.button, 65)
+})
+
+check("鼠标代理: 按下+释放配对去重, 单独释放兜底触发", async () => {
+  const input = new Readable({ read() {} })
+  const mouseEvents: string[] = []
+  const created = createMouseFilterStdin(input as any, () => {})
+  created.bus.on((e) => mouseEvents.push(`m:${e.button}@${e.row},${e.col}${e.release ? "R" : ""}`))
+  // 配对: 按下+同位置释放 → 只触发一次(按下)
+  input.push("\x1b[<0;3;4M")
+  input.push("\x1b[<0;3;4m")
+  await new Promise((r) => setTimeout(r, 50))
+  assert.deepEqual(mouseEvents, ["m:0@3,4"], "同位置按下+释放应去重为一次")
+  // 单独释放(无按下): 兜底触发
+  input.push("\x1b[<0;9;9m")
+  await new Promise((r) => setTimeout(r, 50))
+  assert.deepEqual(mouseEvents, ["m:0@3,4", "m:0@9,9R"], "单独到达的释放应作为点击兜底触发")
 })
 
 check("鼠标代理: 剥离鼠标序列, 文本/方向键原样转发, 跨 chunk 重组", async () => {
@@ -263,6 +282,93 @@ check("danger: 强制推送/关机/提权常客", () => {
   assert.equal(matchDanger("git push origin main"), null)
   assert.equal(matchDanger("npm install"), null)
   assert.equal(matchDanger("cd /tmp && ls"), null)
+})
+
+// ---------- 输入行: 多行输入的可视行拆分 / 光标定位 / 窗口切片 ----------
+
+import { visualLinesOf, inputLineInfo, sliceInputText } from "../src/ui/input.tsx"
+
+check("visualLinesOf 换行符分行", () => {
+  const lines = visualLinesOf("ab\ncd", 80)
+  assert.deepEqual(lines, [
+    { start: 0, end: 2 },
+    { start: 3, end: 5 },
+  ])
+})
+
+check("visualLinesOf 超宽按显示宽折行(宽字符)", () => {
+  // 每字符宽 2, wrap=4 → 每行 2 个汉字
+  const lines = visualLinesOf("你好世界", 4)
+  assert.deepEqual(lines, [
+    { start: 0, end: 2 },
+    { start: 2, end: 4 },
+  ])
+})
+
+check("visualLinesOf 超宽单字符不劈断且独立成行", () => {
+  const lines = visualLinesOf("a你b", 3)
+  assert.deepEqual(lines, [
+    { start: 0, end: 2 }, // "a你" 宽 3, 恰满一行
+    { start: 2, end: 3 }, // "b" 放不下 → 折
+  ])
+})
+
+check("visualLinesOf 行首宽字符不触发空行折行", () => {
+  const lines = visualLinesOf("你好", 3)
+  assert.deepEqual(lines, [
+    { start: 0, end: 1 }, // 你 (行首宽 2 也接纳)
+    { start: 1, end: 2 }, // 好 (放不下 → 折)
+  ])
+})
+
+check("inputLineInfo 光标行与列(显示宽)", () => {
+  const info = inputLineInfo("ab\ncd", 80, 4)
+  assert.equal(info.rows, 2)
+  assert.equal(info.caretRow, 1)
+  assert.equal(info.caretCol, 1) // 光标在 'd' 前 → 前缀 "c" 宽 1
+})
+
+check("inputLineInfo 光标在行首", () => {
+  const info = inputLineInfo("ab\ncd", 80, 3)
+  assert.equal(info.caretRow, 1)
+  assert.equal(info.caretCol, 0)
+})
+
+check("inputLineInfo 光标列按显示宽计(中文)", () => {
+  const info = inputLineInfo("你呢", 80, 1)
+  assert.equal(info.caretRow, 0)
+  assert.equal(info.caretCol, 2) // "你" 宽 2
+})
+
+check("inputLineInfo 空串 rows=1", () => {
+  assert.equal(inputLineInfo("", 40).rows, 1)
+})
+
+check("sliceInputText 窗口切片与 caretAt", () => {
+  const { lines, caretVisible } = sliceInputText("ab\ncd\nef", 80, 0, 2, 4)
+  assert.deepEqual(lines, [
+    { text: "ab", caretAt: null },
+    { text: "cd", caretAt: 1 },
+  ])
+  assert.equal(caretVisible, true)
+})
+
+check("sliceInputText 光标不在窗口内 → caretVisible=false", () => {
+  const { caretVisible } = sliceInputText("ab\ncd\nef", 80, 2, 1, 1)
+  assert.equal(caretVisible, false)
+})
+
+check("sliceInputText 折行后光标仍定位精确", () => {
+  const { lines } = sliceInputText("你好世界", 4, 0, 2, 2)
+  assert.deepEqual(lines, [
+    { text: "你好", caretAt: 2 },
+    { text: "世界", caretAt: 0 }, // 光标恰在第二行行首
+  ])
+})
+
+check("sliceInputText 光标在行尾(index=end)", () => {
+  const { lines } = sliceInputText("ab\ncd", 80, 1, 1, 5)
+  assert.deepEqual(lines, [{ text: "cd", caretAt: 2 }])
 })
 
 // ---------- 收尾 ----------

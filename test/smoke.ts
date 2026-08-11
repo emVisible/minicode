@@ -279,6 +279,51 @@ async function testLLM(): Promise<void> {
   const e2 = await client.stream({ messages: [{ role: "user", content: "x" }], signal: ac.signal }).catch((e: Error) => e)
   check("AbortSignal 中断请求", e2 instanceof Error && /中断/.test(String(e2.message)), String(e2))
   await s5.close()
+
+  // 场景 7: 思考型模型(DeepSeek 系) —— 回答全程走 reasoning_content, content 为 null
+  const s6 = await serve((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: null, reasoning_content: "我们" } }] })}\n\n`)
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: null, reasoning_content: "需要思考" } }] })}\n\n`)
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "", finish_reason: "stop" } }] })}\n\n`)
+    res.write(`data: ${JSON.stringify({ usage: { prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 } })}\n\n`)
+    res.write("data: [DONE]\n\n")
+    res.end()
+  })
+  process.env.LLM_URL = `http://127.0.0.1:${s6.port}/v1`
+  let thinkCollected = ""
+  const r6 = await client.stream({
+    messages: [{ role: "user", content: "x" }],
+    onEvent: (e) => {
+      if (e.type === "think-delta") thinkCollected += e.text
+      if (e.type === "text-delta") thinkCollected += `[C]${e.text}`
+    },
+  })
+  check("思考流(reasoning_content)解析", thinkCollected === "我们需要思考" && r6.message.content === "我们需要思考", `think="${thinkCollected}" content="${r6.message.content}"`)
+  await s6.close()
+
+  // 场景 8: 混合流 —— 先思考后正式回答, 落库只取 content
+  const s7 = await serve((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: null, reasoning_content: "思考中" } }] })}\n\n`)
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "正式回答" } }] })}\n\n`)
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`)
+    res.write("data: [DONE]\n\n")
+    res.end()
+  })
+  process.env.LLM_URL = `http://127.0.0.1:${s7.port}/v1`
+  let mixedThink = ""
+  let mixedText = ""
+  const r7 = await client.stream({
+    messages: [{ role: "user", content: "x" }],
+    onEvent: (e) => {
+      if (e.type === "think-delta") mixedThink += e.text
+      if (e.type === "text-delta") mixedText += e.text
+    },
+  })
+  check("混合流思考与回答分流", mixedThink === "思考中" && mixedText === "正式回答", `think="${mixedThink}" text="${mixedText}"`)
+  check("混合流落库只取 content", r7.message.content === "正式回答" && !r7.message.content.includes("思考中"), r7.message.content)
+  await s7.close()
 }
 
 // ---------- 会话持久化 ----------
